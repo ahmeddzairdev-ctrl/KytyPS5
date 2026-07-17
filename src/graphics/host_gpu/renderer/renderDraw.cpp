@@ -942,6 +942,10 @@ static void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer* buffer, HW::C
 		    &state->vs_input_info, ctx, sh_ctx, &state->ps_input_info, topology, state->ps_active,
 		    state->vs_shader, state->ps_shader);
 
+		if (pipeline == nullptr || pipeline->pipeline == nullptr) {
+			return; // Controlled bypass: wait/skip drawing until pipeline finishes background compilation
+		}
+
 		if (set_bind_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
 		}
