@@ -704,20 +704,20 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 	}
 	// Cache allocations are tracker-page aligned, but byte-disjoint buffers and images may share
 	// an edge page. Clean read-only buffer and image views may coexist; Kyty retains a hard failure
-	// when either cache owns newer GPU bytes. Only a formatted buffer write
-	// performs the image ownership transition below.
+	// when either cache owns newer GPU bytes. Writable buffers delegate the ownership transition
+	// to TextureCache, which distinguishes raw texture-data writes from formatted target paths.
 	if (m_texture_cache->HasPageOverlap(begin, end - begin) &&
 	    m_texture_cache->HasRangeOverlap(vaddr, size)) {
 		const bool coherent_read = is_read && !is_written &&
 		                           !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 		                           !m_texture_cache->HasGpuModifiedRangeOverlap(vaddr, size);
 		if (!coherent_read) {
-			if (!is_written || !is_formatted) {
+			if (!is_written) {
 				EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
 				     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
 				     vaddr, size, is_read, is_written, is_formatted);
 			}
-			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, true);
+			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
 	}
 	if (is_written) {
@@ -1243,12 +1243,6 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("BufferCache: invalid image-backing publication, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
 	FaultSafeCacheLock lock(this, m_mutex);
 	auto               owner = m_buffers.end();
 	for (auto it = m_buffers.begin(); it != m_buffers.end(); ++it) {
@@ -1265,10 +1259,7 @@ void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
 		}
 		owner = it;
 	}
-	if ((owner != m_buffers.end() &&
-	     (owner->second->ctx == nullptr || owner->second->buffer == nullptr ||
-	      owner->second->buffer->buffer == nullptr ||
-	      m_memory_tracker.IsRegionCpuModified(vaddr, size))) ||
+	if ((owner != m_buffers.end() && m_memory_tracker.IsRegionCpuModified(vaddr, size)) ||
 	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
 	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
 		EXIT("BufferCache: image backing requires clean buffer ownership, addr=0x%016" PRIx64
