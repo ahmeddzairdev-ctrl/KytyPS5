@@ -42,7 +42,16 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+inline const char* string_VkResult(VkResult result) {
+	return "VkResult";
+}
+inline const char* string_VkFormat(VkFormat format) {
+	return "VkFormat";
+}
+#else
 #include <vulkan/vk_enum_string_helper.h>
+#endif
 
 // IWYU pragma: no_forward_declare VkImageView_T
 

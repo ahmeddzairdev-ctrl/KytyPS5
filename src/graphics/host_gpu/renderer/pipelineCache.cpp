@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/AsyncPipelineBuilder.h"
 
 #include "common/assert.h"
+#include "loader/systemContent.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -24,6 +25,98 @@
 namespace Libs::Graphics {
 
 std::unique_ptr<Libs::Graphics::AsyncPipelineBuilder> g_AsyncPipelineBuilder;
+std::shared_mutex g_pipeline_cache_mutex;
+
+std::string GetCurrentGameTitleId() {
+	std::string title_id;
+	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
+		title_id = "UNKNOWN";
+	}
+	return title_id;
+}
+
+VkPipelineCache GetVkPipelineCacheHandle() {
+	if (!g_AsyncPipelineBuilder) {
+		auto* gctx = g_render_ctx->GetGraphicCtx();
+		std::string title_id = GetCurrentGameTitleId();
+		std::string cache_path = "cache/pipelines/" + title_id + "_pipeline.cache";
+		Common::File::CreateDirectories("cache/pipelines");
+		g_AsyncPipelineBuilder = std::make_unique<Libs::Graphics::AsyncPipelineBuilder>(
+		    gctx->device, gctx->physical_device, cache_path);
+
+		g_render_ctx->GetPipelineCache()->InitializeFallbackPipeline();
+	}
+	return g_AsyncPipelineBuilder->GetVkPipelineCache();
+}
+
+static const std::vector<uint32_t> k_fallback_vert_shader = {
+	0x07230203u, 0x00010000u, 0x0008000bu, 0x00000006u, 0x00000000u, 0x00020011u, 0x00000001u,
+	0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu,
+	0x00000000u, 0x00000001u, 0x0005000fu, 0x00000000u, 0x00000004u, 0x6e69616du, 0x00000000u,
+	0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u,
+	0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u, 0x00000002u,
+	0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x000100fdu, 0x00010038u
+};
+
+static const std::vector<uint32_t> k_fallback_frag_shader = {
+	0x07230203u, 0x00010000u, 0x0008000bu, 0x00000006u, 0x00000000u, 0x00020011u, 0x00000001u,
+	0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu,
+	0x00000000u, 0x00000001u, 0x0005000fu, 0x00000000u, 0x00000004u, 0x6e69616du, 0x00000000u,
+	0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u,
+	0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u, 0x00000002u,
+	0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x000100fdu, 0x00010038u
+};
+
+void PipelineCache::InitializeFallbackPipeline() {
+	if (m_fallback_pipeline.pipeline != nullptr) {
+		return;
+	}
+
+	auto* gctx = g_render_ctx->GetGraphicCtx();
+	if (gctx == nullptr || gctx->device == nullptr) {
+		return;
+	}
+
+	VkAttachmentDescription attachment{};
+	attachment.format = VK_FORMAT_B8G8R8A8_UNORM;
+	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+	VkAttachmentReference color_attachment{};
+	color_attachment.attachment = 0;
+	color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &color_attachment;
+
+	VkRenderPassCreateInfo rp_info{};
+	rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	rp_info.attachmentCount = 1;
+	rp_info.pAttachments = &attachment;
+	rp_info.subpassCount = 1;
+	rp_info.pSubpasses = &subpass;
+
+	auto result = vkCreateRenderPass(gctx->device, &rp_info, nullptr, &m_fallback_render_pass);
+	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+
+	ShaderVertexInputInfo vs_input_info{};
+	ShaderPixelInputInfo ps_input_info{};
+	PipelineStaticParameters static_params{};
+	static_params.color_count = 1;
+
+	CreatePipelineInternal(&m_fallback_pipeline, m_fallback_render_pass,
+	                       &vs_input_info, k_fallback_vert_shader,
+	                       &ps_input_info, k_fallback_frag_shader,
+	                       static_params, 0, 0, 0, 0,
+	                       true, g_AsyncPipelineBuilder->GetVkPipelineCache());
+}
 
 namespace {
 
@@ -166,11 +259,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		return iter->second.get();
 	}
 
-	if (!g_AsyncPipelineBuilder) {
-		auto* gctx = g_render_ctx->GetGraphicCtx();
-		g_AsyncPipelineBuilder = std::make_unique<Libs::Graphics::AsyncPipelineBuilder>(
-		    gctx->device, gctx->physical_device, "kyty_pipeline.cache");
-	}
+	VkPipelineCache pipeline_cache_handle = GetVkPipelineCacheHandle();
 
 	VkPipeline       pipeline_handle = nullptr;
 	VkPipelineLayout layout_handle   = nullptr;
@@ -188,7 +277,21 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	}
 
 	if (status == AsyncPipelineBuilder::Status::Pending) {
-		return nullptr; // Controlled nullptr for pending pipeline
+		if (auto iter = m_fallback_pipelines.find(key); iter != m_fallback_pipelines.end()) {
+			return iter->second.get();
+		}
+
+		auto fallback_cached = std::make_unique<GraphicsPipeline>(p);
+		CreatePipelineInternal(fallback_cached.get(), framebuffer->render_pass,
+		                       vs_input_info, k_fallback_vert_shader,
+		                       ps_input_info, k_fallback_frag_shader,
+		                       static_params, vs_id.hash0, vs_id.crc32,
+		                       ps_id.hash0, ps_id.crc32, ps_active,
+		                       pipeline_cache_handle);
+
+		auto* ptr = fallback_cached.get();
+		m_fallback_pipelines.emplace(key, std::move(fallback_cached));
+		return ptr;
 	}
 
 	// If NotFound or Error, dispatch compilation task
@@ -241,7 +344,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo*      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(cached.get(), input_info, cs_spirv);
+	CreatePipelineInternal(cached.get(), input_info, cs_spirv, GetVkPipelineCacheHandle());
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -279,10 +382,25 @@ void PipelineCache::DeletePipeline(Pipeline* pipeline) {
 void PipelineCache::DeleteAllPipelines() {
 	Common::LockGuard lock(m_mutex);
 
+	if (m_fallback_pipeline.pipeline != nullptr) {
+		DeletePipelineInternal(&m_fallback_pipeline);
+	}
+
+	if (m_fallback_render_pass != nullptr) {
+		auto* gctx = g_render_ctx->GetGraphicCtx();
+		vkDestroyRenderPass(gctx->device, m_fallback_render_pass, nullptr);
+		m_fallback_render_pass = nullptr;
+	}
+
 	for (auto& item: m_graphics_pipelines) {
 		DeletePipelineInternal(item.second.get());
 	}
 	m_graphics_pipelines.clear();
+
+	for (auto& item: m_fallback_pipelines) {
+		DeletePipelineInternal(item.second.get());
+	}
+	m_fallback_pipelines.clear();
 
 	for (auto& item: m_compute_pipelines) {
 		DeletePipelineInternal(item.second.get());

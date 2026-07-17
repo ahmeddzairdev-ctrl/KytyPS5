@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/AsyncPipelineBuilder.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
@@ -48,7 +49,16 @@
 #include <memory>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+inline const char* string_VkResult(VkResult result) {
+	return "VkResult";
+}
+inline const char* string_VkImageLayout(VkImageLayout layout) {
+	return "VkImageLayout";
+}
+#else
 #include <vulkan/vk_enum_string_helper.h>
+#endif
 #include <vulkan/vk_platform.h>
 
 // IWYU pragma: no_include <intrin.h>
@@ -536,6 +546,10 @@ void WindowPresentFrame(PreparedFrame* frame) {
 
 	RenderDocOnPresent();
 	WindowUpdateTitle();
+
+	if (g_AsyncPipelineBuilder) {
+		g_AsyncPipelineBuilder->SaveCachePeriodically();
+	}
 }
 
 } // namespace Libs::Graphics
