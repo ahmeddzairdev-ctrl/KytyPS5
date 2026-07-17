@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipelineCache.h"
+#include "graphics/host_gpu/AsyncPipelineBuilder.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -18,6 +19,8 @@
 #include <utility>
 
 namespace Libs::Graphics {
+
+std::unique_ptr<Libs::Graphics::AsyncPipelineBuilder> g_AsyncPipelineBuilder;
 
 namespace {
 
@@ -160,34 +163,51 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		return iter->second.get();
 	}
 
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(vs_input_info);
-		if (ps_active) {
-			ShaderDbgDumpInputInfo(ps_input_info);
-		}
-		LOGF("PipelineTrace: shader binaries VS=0x%08" PRIx32 "/0x%08" PRIx32 " words=%" PRIu64
-		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " words=%" PRIu64 "\n",
-		     vs_id.hash0, vs_id.crc32, static_cast<uint64_t>(vs_spirv.size()), ps_id.hash0,
-		     ps_id.crc32, static_cast<uint64_t>(ps_spirv.size()));
+	if (!g_AsyncPipelineBuilder) {
+		auto* gctx = g_render_ctx->GetGraphicCtx();
+		g_AsyncPipelineBuilder = std::make_unique<Libs::Graphics::AsyncPipelineBuilder>(
+		    gctx->device, gctx->physical_device, "kyty_pipeline.cache");
 	}
 
-	auto cached = std::make_unique<GraphicsPipeline>(p);
-	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
-	CreatePipelineInternal(cached.get(), framebuffer->render_pass, vs_input_info, vs_spirv,
-	                       ps_input_info, ps_spirv, static_params, vs_id.hash0, vs_id.crc32,
-	                       ps_id.hash0, ps_id.crc32, ps_active);
-	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
+	VkPipeline       pipeline_handle = nullptr;
+	VkPipelineLayout layout_handle   = nullptr;
+	auto status = g_AsyncPipelineBuilder->QueryPipeline(key, pipeline_handle, layout_handle);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (status == AsyncPipelineBuilder::Status::Completed) {
+		auto cached = std::make_unique<GraphicsPipeline>(p);
+		cached->pipeline        = pipeline_handle;
+		cached->pipeline_layout = layout_handle;
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-	EXIT_IF(!inserted);
-	DumpPipeline("create", *iter->second);
+		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+		EXIT_IF(!inserted);
+		DumpPipeline("create", *iter->second);
+		return iter->second.get();
+	}
 
-	return iter->second.get();
+	if (status == AsyncPipelineBuilder::Status::Pending) {
+		return nullptr; // Controlled nullptr for pending pipeline
+	}
+
+	// If NotFound or Error, dispatch compilation task
+	ShaderPixelInputInfo ps_info_copy {};
+	if (ps_active && ps_input_info != nullptr) {
+		ps_info_copy = *ps_input_info;
+	}
+
+	g_AsyncPipelineBuilder->RequestPipeline(
+	    key,
+	    framebuffer->render_pass,
+	    *vs_input_info,
+	    std::vector<uint32_t>(vs_spirv.begin(), vs_spirv.end()),
+	    ps_info_copy,
+	    std::vector<uint32_t>(ps_spirv.begin(), ps_spirv.end()),
+	    static_params,
+	    vs_id.hash0, vs_id.crc32,
+	    ps_id.hash0, ps_id.crc32,
+	    ps_active
+	);
+
+	return nullptr; // Controlled nullptr, compiling in background
 }
 
 PipelineCache::ComputePipeline*

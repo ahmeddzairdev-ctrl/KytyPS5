@@ -469,7 +469,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
                             std::span<const uint32_t>       ps_shader,
                             const PipelineStaticParameters& static_params, uint32_t vs_hash0,
                             uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active) {
+                            bool ps_active, VkPipelineCache pipeline_cache) {
 	EXIT_IF(g_render_ctx == nullptr);
 	EXIT_IF(pipeline == nullptr);
 	EXIT_IF(render_pass == nullptr);
@@ -936,7 +936,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
 		     scissor.extent.width, scissor.extent.height);
 	}
-	result = vkCreateGraphicsPipelines(gctx->device, nullptr, 1, &pipeline_info, nullptr,
+	result = vkCreateGraphicsPipelines(gctx->device, pipeline_cache, 1, &pipeline_info, nullptr,
 	                                   &pipeline->pipeline);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",

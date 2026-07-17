@@ -18,6 +18,8 @@
 
 namespace Libs::Graphics {
 
+class AsyncPipelineBuilder; // Forward declaration
+
 struct VulkanFramebuffer;
 
 namespace HW {
@@ -31,6 +33,8 @@ public:
 	PipelineCache() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
 	virtual ~PipelineCache() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(PipelineCache);
+
+	friend class AsyncPipelineBuilder; // Friend declaration
 
 	struct Pipeline {
 		VkPipelineLayout pipeline_layout = nullptr;
@@ -142,7 +146,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
                             std::span<const uint32_t>       ps_shader,
                             const PipelineStaticParameters& static_params, uint32_t vs_hash0,
                             uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active);
+                            bool ps_active, VkPipelineCache pipeline_cache = nullptr);
 void CreatePipelineInternal(PipelineCache::ComputePipeline* pipeline,
                             const ShaderComputeInputInfo*   input_info,
                             std::span<const uint32_t>       cs_shader);
