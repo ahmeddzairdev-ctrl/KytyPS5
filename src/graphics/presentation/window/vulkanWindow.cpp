@@ -230,42 +230,19 @@ static VulkanQueues VulkanFindQueues(VkPhysicalDevice device, VkSurfaceKHR surfa
 	};
 
 	select_queues(graphics_num, [](const auto& q) { return q.graphics; }, qs.graphics);
-	select_queues(compute_num, [](const auto& q) { return q.compute; }, qs.compute);
+
+	// BufferCache assumes compute queues share the graphics queue's family.
+	// On some AMD GPUs the old code picked compute queues from a second
+	// family instead, which crashed later on.
+	const uint32_t graphics_family =
+	    qs.graphics.empty() ? static_cast<uint32_t>(-1) : qs.graphics.front().family;
+	select_queues(
+	    compute_num,
+	    [graphics_family](const auto& q) { return q.compute && q.family == graphics_family; },
+	    qs.compute);
+
 	select_queues(transfer_num, [](const auto& q) { return q.transfer; }, qs.transfer);
 	select_queues(present_num, [](const auto& q) { return q.present; }, qs.present);
-
-	// Many GPUs -- most AMD desktop parts in particular -- only report WSI/present
-	// support on the same queue family that also has graphics capability, and often
-	// expose just a single queue in that family. By the time we get here, that queue
-	// has already been claimed for qs.graphics and removed from the pool, so the
-	// present_num search above finds nothing even though a perfectly usable
-	// present-capable queue exists. Vulkan explicitly allows the same VkQueue to be
-	// used both for graphics submission and vkQueuePresentKHR (VulkanCreateQueues
-	// already relies on this same aliasing trick for the utility/transfer queue
-	// further down), so fall back to reusing an already-selected queue instead of
-	// rejecting the whole device.
-	if (qs.present.empty()) {
-		const QueueInfo* reuse = nullptr;
-		for (const auto& q: qs.graphics) {
-			if (q.present) {
-				reuse = &q;
-				break;
-			}
-		}
-		if (reuse == nullptr) {
-			for (const auto& q: qs.compute) {
-				if (q.present) {
-					reuse = &q;
-					break;
-				}
-			}
-		}
-		if (reuse != nullptr) {
-			LOGF("\tno distinct present queue left, reusing family = %u, index = %u\n",
-			     reuse->family, reuse->index);
-			qs.present.push_back(*reuse);
-		}
-	}
 
 	return qs;
 }
@@ -466,11 +443,8 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 			skip_device = true;
 		}
 
-		if (!skip_device && !CheckFormat(device, VK_FORMAT_D24_UNORM_S8_UINT, true,
-		                                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-			LOGF("Format VK_FORMAT_D24_UNORM_S8_UINT cannot be used as depth buffer\n");
-			skip_device = true;
-		}
+		// D24_UNORM_S8_UINT is never actually used by ResolveRenderDepthTarget(),
+		// so requiring it here only rejected some AMD GPUs for no reason.
 
 		if (!skip_device && !CheckFormat(device, VK_FORMAT_BC3_SRGB_BLOCK, true,
 		                                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
@@ -864,7 +838,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
 			severity_str   = "E";
 			severity_style = Log::Color::BrightRed;
-			error          = true;
+			// Only validation errors are fatal; GENERAL-type errors can come
+			// from unrelated loader/layer issues (e.g. a broken overlay).
+			error = (message_types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
 			break;
 		default: severity_str = "?";
 	}
