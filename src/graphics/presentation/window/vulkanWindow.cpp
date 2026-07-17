@@ -234,6 +234,39 @@ static VulkanQueues VulkanFindQueues(VkPhysicalDevice device, VkSurfaceKHR surfa
 	select_queues(transfer_num, [](const auto& q) { return q.transfer; }, qs.transfer);
 	select_queues(present_num, [](const auto& q) { return q.present; }, qs.present);
 
+	// Many GPUs -- most AMD desktop parts in particular -- only report WSI/present
+	// support on the same queue family that also has graphics capability, and often
+	// expose just a single queue in that family. By the time we get here, that queue
+	// has already been claimed for qs.graphics and removed from the pool, so the
+	// present_num search above finds nothing even though a perfectly usable
+	// present-capable queue exists. Vulkan explicitly allows the same VkQueue to be
+	// used both for graphics submission and vkQueuePresentKHR (VulkanCreateQueues
+	// already relies on this same aliasing trick for the utility/transfer queue
+	// further down), so fall back to reusing an already-selected queue instead of
+	// rejecting the whole device.
+	if (qs.present.empty()) {
+		const QueueInfo* reuse = nullptr;
+		for (const auto& q: qs.graphics) {
+			if (q.present) {
+				reuse = &q;
+				break;
+			}
+		}
+		if (reuse == nullptr) {
+			for (const auto& q: qs.compute) {
+				if (q.present) {
+					reuse = &q;
+					break;
+				}
+			}
+		}
+		if (reuse != nullptr) {
+			LOGF("\tno distinct present queue left, reusing family = %u, index = %u\n",
+			     reuse->family, reuse->index);
+			qs.present.push_back(*reuse);
+		}
+	}
+
 	return qs;
 }
 
