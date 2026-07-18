@@ -16,8 +16,12 @@
 #include <functional>
 #include <fstream>
 #include <algorithm>
+#include <shared_mutex>
+#include <chrono>
 
 namespace Libs::Graphics {
+
+extern std::shared_mutex g_pipeline_cache_mutex;
 
 class AsyncPipelineBuilder {
 public:
@@ -35,7 +39,8 @@ public:
 	};
 
 	AsyncPipelineBuilder(VkDevice device, VkPhysicalDevice physical_device, const std::string& cache_path)
-	    : m_device(device), m_physical_device(physical_device), m_cache_path(cache_path) {
+	    : m_device(device), m_physical_device(physical_device), m_cache_path(cache_path),
+	      m_last_save_time(std::chrono::steady_clock::now()) {
 
 		LoadCache();
 
@@ -59,6 +64,7 @@ public:
 		SaveCache();
 
 		if (m_pipeline_cache != nullptr) {
+			std::unique_lock<std::shared_mutex> lock(g_pipeline_cache_mutex);
 			vkDestroyPipelineCache(m_device, m_pipeline_cache, nullptr);
 		}
 	}
@@ -126,13 +132,48 @@ public:
 					std::lock_guard<std::mutex> map_lock(m_map_mutex);
 					if (pipeline_result.pipeline != nullptr) {
 						m_results[key] = {Status::Completed, pipeline_result.pipeline, pipeline_result.pipeline_layout};
+						m_cache_dirty = true;
 					} else {
 						m_results[key] = {Status::Error, nullptr, nullptr};
 					}
 				}
+
+				SaveCachePeriodically();
 			});
 		}
 		m_cv.notify_one();
+	}
+
+	void SaveCachePeriodically() {
+		auto now = std::chrono::steady_clock::now();
+		bool should_save = false;
+		{
+			std::lock_guard<std::mutex> lock(m_map_mutex);
+			if (m_cache_dirty && std::chrono::duration_cast<std::chrono::seconds>(now - m_last_save_time).count() >= 10) {
+				should_save = true;
+				m_cache_dirty = false;
+				m_last_save_time = now;
+			}
+		}
+
+		if (should_save) {
+			std::lock_guard<std::mutex> lock(m_queue_mutex);
+			if (!m_stop) {
+				m_tasks.emplace([this, now]() {
+					std::lock_guard<std::mutex> lock(m_save_mutex);
+					if (!SaveCache()) {
+						std::lock_guard<std::mutex> map_lock(m_map_mutex);
+						m_cache_dirty = true;
+					}
+				});
+				m_cv.notify_one();
+			}
+		}
+	}
+
+	void MarkCacheDirty() {
+		std::lock_guard<std::mutex> lock(m_map_mutex);
+		m_cache_dirty = true;
 	}
 
 private:
@@ -155,10 +196,12 @@ private:
 		vkCreatePipelineCache(m_device, &create_info, nullptr, &m_pipeline_cache);
 	}
 
-	void SaveCache() {
+	bool SaveCache() {
 		if (m_pipeline_cache == nullptr) {
-			return;
+			return false;
 		}
+
+		std::unique_lock<std::shared_mutex> lock(g_pipeline_cache_mutex);
 
 		size_t cache_size = 0;
 		vkGetPipelineCacheData(m_device, m_pipeline_cache, &cache_size, nullptr);
@@ -168,9 +211,11 @@ private:
 				std::ofstream file(m_cache_path, std::ios::binary);
 				if (file.is_open()) {
 					file.write(cache_data.data(), cache_size);
+					return true;
 				}
 			}
 		}
+		return false;
 	}
 
 	void WorkerLoop(std::stop_token stop_token) {
@@ -211,7 +256,13 @@ private:
 
 	std::mutex                                                                                           m_map_mutex;
 	std::unordered_map<PipelineCache::GraphicsPipelineKey, Result, PipelineCache::GraphicsPipelineKeyHash> m_results;
+
+	std::mutex                                            m_save_mutex;
+	bool                                                  m_cache_dirty = false;
+	std::chrono::steady_clock::time_point                 m_last_save_time;
 };
+
+extern std::unique_ptr<AsyncPipelineBuilder> g_AsyncPipelineBuilder;
 
 } // namespace Libs::Graphics
 
