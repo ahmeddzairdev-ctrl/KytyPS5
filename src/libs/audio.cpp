@@ -100,7 +100,6 @@ private:
 		uint32_t samples_num      = 0;
 		uint32_t freq             = 0;
 		Format   format           = Format::Unknown;
-		uint64_t last_output_time = 0;
 		int      channels_num     = 0;
 		int      volume[8]        = {};
 
@@ -324,7 +323,22 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	EXIT_IF(port == nullptr);
 
-	if (port->audio_device == 0 || data == nullptr) {
+	if (port->audio_device == 0) {
+		return false;
+	}
+
+	// A null buffer is a blocking drain request; wait for queued audio to finish.
+	if (data == nullptr) {
+		if (blocking) {
+			const auto wait_start = LibKernel::KernelGetProcessTime();
+			while (SDL_GetQueuedAudioSize(port->audio_device) != 0) {
+				if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
+					SDL_ClearQueuedAudio(port->audio_device);
+					break;
+				}
+				Common::Thread::SleepMicro(1000);
+			}
+		}
 		return false;
 	}
 
@@ -395,7 +409,6 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			port.samples_num      = samples_num;
 			port.freq             = freq;
 			port.format           = format;
-			port.last_output_time = 0;
 
 			switch (format) {
 				case Format::Signed16bitMono:
@@ -500,29 +513,10 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 	const auto& first_port = m_out_ports[params[0].handle.GetId()];
 
-	uint64_t block_time   = (1000000 * first_port.samples_num) / first_port.freq;
-	uint64_t current_time = LibKernel::KernelGetProcessTime();
-
-	uint64_t max_wait_time = 0;
-
-	for (uint32_t i = 0; i < num; i++) {
-		uint64_t next_time = m_out_ports[params[i].handle.GetId()].last_output_time + block_time;
-		uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
-		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
-	}
-
-	if (blocking && max_wait_time != 0) {
-		Common::Thread::SleepMicro(max_wait_time);
-	}
-
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
 
 		QueueSdlAudio(&port, params[i].data, blocking);
-	}
-
-	for (uint32_t i = 0; i < num; i++) {
-		m_out_ports[params[i].handle.GetId()].last_output_time = LibKernel::KernelGetProcessTime();
 	}
 
 	return first_port.samples_num;
