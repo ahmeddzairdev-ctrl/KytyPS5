@@ -140,6 +140,19 @@ private:
 		}
 	};
 
+	GraphicsPipeline* GetOrCreateDynamicFallbackPipeline(
+		const GraphicsPipelineKey& key,
+		VulkanFramebuffer* framebuffer,
+		ShaderVertexInputInfo* vs_input_info,
+		ShaderPixelInputInfo* ps_input_info,
+		const PipelineStaticParameters& static_params,
+		const ShaderId& vs_id,
+		const ShaderId& ps_id,
+		bool ps_active,
+		VkPipelineCache pipeline_cache_handle,
+		const GraphicsPipeline& p
+	);
+
 	struct ComputePipelineKey {
 		ShaderId cs_shader_id;
 

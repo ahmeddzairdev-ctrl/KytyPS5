@@ -157,9 +157,23 @@ public:
 		}
 
 		if (should_save) {
-			std::lock_guard<std::mutex> lock(m_save_mutex);
-			SaveCache();
+			std::lock_guard<std::mutex> lock(m_queue_mutex);
+			if (!m_stop) {
+				m_tasks.emplace([this, now]() {
+					std::lock_guard<std::mutex> lock(m_save_mutex);
+					if (!SaveCache()) {
+						std::lock_guard<std::mutex> map_lock(m_map_mutex);
+						m_cache_dirty = true;
+					}
+				});
+				m_cv.notify_one();
+			}
 		}
+	}
+
+	void MarkCacheDirty() {
+		std::lock_guard<std::mutex> lock(m_map_mutex);
+		m_cache_dirty = true;
 	}
 
 private:
@@ -182,9 +196,9 @@ private:
 		vkCreatePipelineCache(m_device, &create_info, nullptr, &m_pipeline_cache);
 	}
 
-	void SaveCache() {
+	bool SaveCache() {
 		if (m_pipeline_cache == nullptr) {
-			return;
+			return false;
 		}
 
 		std::unique_lock<std::shared_mutex> lock(g_pipeline_cache_mutex);
@@ -197,9 +211,11 @@ private:
 				std::ofstream file(m_cache_path, std::ios::binary);
 				if (file.is_open()) {
 					file.write(cache_data.data(), cache_size);
+					return true;
 				}
 			}
 		}
+		return false;
 	}
 
 	void WorkerLoop(std::stop_token stop_token) {

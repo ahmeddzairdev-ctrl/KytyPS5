@@ -61,11 +61,41 @@ static const std::vector<uint32_t> k_fallback_vert_shader = {
 static const std::vector<uint32_t> k_fallback_frag_shader = {
 	0x07230203u, 0x00010000u, 0x0008000bu, 0x00000006u, 0x00000000u, 0x00020011u, 0x00000001u,
 	0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu,
-	0x00000000u, 0x00000001u, 0x0005000fu, 0x00000000u, 0x00000004u, 0x6e69616du, 0x00000000u,
-	0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u,
-	0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u, 0x00000002u,
-	0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x000100fdu, 0x00010038u
+	0x00000000u, 0x00000001u, 0x0005000fu, 0x00000004u, 0x00000004u, 0x6e69616du, 0x00000000u,
+	0x00030010u, 0x00000004u, 0x00000007u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u,
+	0x00000004u, 0x6e69616du, 0x00000000u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u,
+	0x00000002u, 0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u,
+	0x00000005u, 0x000100fdu, 0x00010038u
 };
+
+PipelineCache::GraphicsPipeline* PipelineCache::GetOrCreateDynamicFallbackPipeline(
+	const GraphicsPipelineKey& key,
+	VulkanFramebuffer* framebuffer,
+	ShaderVertexInputInfo* vs_input_info,
+	ShaderPixelInputInfo* ps_input_info,
+	const PipelineStaticParameters& static_params,
+	const ShaderId& vs_id,
+	const ShaderId& ps_id,
+	bool ps_active,
+	VkPipelineCache pipeline_cache_handle,
+	const GraphicsPipeline& p
+) {
+	if (auto iter = m_fallback_pipelines.find(key); iter != m_fallback_pipelines.end()) {
+		return iter->second.get();
+	}
+
+	auto fallback_cached = std::make_unique<GraphicsPipeline>(p);
+	CreatePipelineInternal(fallback_cached.get(), framebuffer->render_pass,
+	                       vs_input_info, k_fallback_vert_shader,
+	                       ps_input_info, k_fallback_frag_shader,
+	                       static_params, vs_id.hash0, vs_id.crc32,
+	                       ps_id.hash0, ps_id.crc32, ps_active,
+	                       pipeline_cache_handle);
+
+	auto* ptr = fallback_cached.get();
+	m_fallback_pipelines.emplace(key, std::move(fallback_cached));
+	return ptr;
+}
 
 void PipelineCache::InitializeFallbackPipeline() {
 	if (m_fallback_pipeline.pipeline != nullptr) {
@@ -273,25 +303,15 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		DumpPipeline("create", *iter->second);
+
+		// Fallback pipelines are kept alive in m_fallback_pipelines and cleaned up at teardown (DeleteAllPipelines)
+		// to avoid wait-idle stutters or destroying a pipeline currently in use by an in-flight frame.
+
 		return iter->second.get();
 	}
 
 	if (status == AsyncPipelineBuilder::Status::Pending) {
-		if (auto iter = m_fallback_pipelines.find(key); iter != m_fallback_pipelines.end()) {
-			return iter->second.get();
-		}
-
-		auto fallback_cached = std::make_unique<GraphicsPipeline>(p);
-		CreatePipelineInternal(fallback_cached.get(), framebuffer->render_pass,
-		                       vs_input_info, k_fallback_vert_shader,
-		                       ps_input_info, k_fallback_frag_shader,
-		                       static_params, vs_id.hash0, vs_id.crc32,
-		                       ps_id.hash0, ps_id.crc32, ps_active,
-		                       pipeline_cache_handle);
-
-		auto* ptr = fallback_cached.get();
-		m_fallback_pipelines.emplace(key, std::move(fallback_cached));
-		return ptr;
+		return GetOrCreateDynamicFallbackPipeline(key, framebuffer, vs_input_info, ps_input_info, static_params, vs_id, ps_id, ps_active, pipeline_cache_handle, p);
 	}
 
 	// If NotFound or Error, dispatch compilation task
@@ -313,7 +333,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	    ps_active
 	);
 
-	return nullptr; // Controlled nullptr, compiling in background
+	return GetOrCreateDynamicFallbackPipeline(key, framebuffer, vs_input_info, ps_input_info, static_params, vs_id, ps_id, ps_active, pipeline_cache_handle, p);
 }
 
 PipelineCache::ComputePipeline*
@@ -351,6 +371,10 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo*      input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+
+	if (g_AsyncPipelineBuilder) {
+		g_AsyncPipelineBuilder->MarkCacheDirty();
+	}
 
 	return iter->second.get();
 }

@@ -21,10 +21,28 @@
 #include <span>
 #if defined(__linux__)
 inline const char* string_VkResult(VkResult result) {
-	return "VkResult";
+	switch (result) {
+		case VK_SUCCESS: return "VK_SUCCESS";
+		case VK_NOT_READY: return "VK_NOT_READY";
+		case VK_TIMEOUT: return "VK_TIMEOUT";
+		case VK_EVENT_SET: return "VK_EVENT_SET";
+		case VK_EVENT_RESET: return "VK_EVENT_RESET";
+		case VK_INCOMPLETE: return "VK_INCOMPLETE";
+		case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+		case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+		case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+		case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+		default: return "VK_UNKNOWN_RESULT";
+	}
 }
 inline const char* string_VkFormat(VkFormat format) {
-	return "VkFormat";
+	switch (format) {
+		case VK_FORMAT_UNDEFINED: return "VK_FORMAT_UNDEFINED";
+		case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+		case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+		case VK_FORMAT_R32G32B32A32_SFLOAT: return "VK_FORMAT_R32G32B32A32_SFLOAT";
+		default: return "VK_UNKNOWN_FORMAT";
+	}
 }
 #else
 #include <vulkan/vk_enum_string_helper.h>
