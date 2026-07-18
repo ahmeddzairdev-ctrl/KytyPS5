@@ -67,7 +67,7 @@ enum class VulkanImageType {
 };
 
 struct VulkanImage {
-	static constexpr int VIEW_MAX                   = 21;
+	static constexpr int VIEW_MAX                   = 22;
 	static constexpr int VIEW_DEFAULT               = 0;
 	static constexpr int VIEW_BGRA                  = 1;
 	static constexpr int VIEW_DEPTH_TEXTURE         = 2;
@@ -89,6 +89,7 @@ struct VulkanImage {
 	static constexpr int VIEW_STORAGE               = 18;
 	static constexpr int VIEW_STORAGE_ARRAY         = 19;
 	static constexpr int VIEW_BGRA_TO_RGBA          = 20;
+	static constexpr int VIEW_ABGR                  = 21;
 
 	explicit VulkanImage(VulkanImageType type): type(type) {}
 
@@ -129,6 +130,10 @@ struct TextureVulkanImage: public GpuTextureVulkanImage {
 };
 
 struct StorageTextureVulkanImage: public GpuTextureVulkanImage {
+	struct StorageView {
+		uint32_t    base_level = 0;
+		VkImageView view       = nullptr;
+	};
 	struct SampledView {
 		VkFormat    format      = VK_FORMAT_UNDEFINED;
 		uint32_t    swizzle     = 0;
@@ -140,6 +145,8 @@ struct StorageTextureVulkanImage: public GpuTextureVulkanImage {
 	StorageTextureVulkanImage(): GpuTextureVulkanImage(VulkanImageType::StorageTexture) {}
 	std::mutex               sampled_view_mutex;
 	std::vector<SampledView> sampled_views;
+	std::mutex               storage_view_mutex;
+	std::vector<StorageView> storage_views;
 };
 
 struct RenderTextureVulkanImage: public VulkanImage {
