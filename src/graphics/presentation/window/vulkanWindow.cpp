@@ -1082,6 +1082,8 @@ void VulkanCreate(WindowContext* ctx) {
 
 	vkGetPhysicalDeviceProperties(ctx->graphic_ctx.physical_device,
 	                              &ctx->graphic_ctx.physical_device_properties);
+	vkGetPhysicalDeviceMemoryProperties(ctx->graphic_ctx.physical_device,
+	                                    &ctx->graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = ctx->graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName);
