@@ -9,11 +9,16 @@
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptors.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/renderVertex.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/renderer/tiler.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
@@ -8676,6 +8681,51 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
          context->texture->InvalidateMemory(access, vaddr, size, phase);
 }
 
+[[noreturn]] void RunReverseRenderTargetDeathCase() {
+  (void)TextureGetRenderTargetFormat(12u, 7u, 3u);
+  std::_Exit(0x7f);
+}
+
+void CheckReverseRenderTargetFormatContract() {
+  const auto format = TextureGetRenderTargetFormat(12u, 7u, 2u);
+  Require("ReverseRenderTarget", "exact format",
+          format.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+              format.bytes_per_element == 8u &&
+              format.export_mapping == Prospero::ColorMappingAbgr,
+          "exact reverse RGBA16F render-target tuple was rejected");
+  Require("ReverseRenderTarget", "write masks",
+          format.export_mapping.ApplyMask(0x1u) == 0x8u &&
+              format.export_mapping.ApplyMask(0x2u) == 0x4u &&
+              format.export_mapping.ApplyMask(0x4u) == 0x2u &&
+              format.export_mapping.ApplyMask(0x8u) == 0x1u &&
+              format.export_mapping.ApplyMask(0xfu) == 0xfu,
+          "reverse RGBA16F component mask was not mapped exactly once");
+
+  char path[MAX_PATH]{};
+  Require("ReverseRenderTarget", "host",
+          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string command = std::string("\"") + path + "\" --reverse-rt-death";
+  std::vector<char> mutable_command(command.begin(), command.end());
+  mutable_command.push_back('\0');
+  STARTUPINFOA startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  Require("ReverseRenderTarget", "host",
+          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0,
+          "CreateProcess failed");
+  Require("ReverseRenderTarget", "host",
+          WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+          "unsupported adjacent render-target tuple timed out");
+  DWORD exit_code = 0;
+  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  Require("ReverseRenderTarget", "hard failure", exited && exit_code == 321,
+          "adjacent unproven render-target tuple did not retain the fatal guard");
+  std::printf("[host]    %-32s ok\n", "ReverseRenderTargetFormat");
+}
+
 [[noreturn]] void RunImageViewDeathCase(const char *kind) {
   if (std::strcmp(kind, "sampled") == 0) {
     (void)SelectSampledColorView(VK_FORMAT_R8G8B8A8_UNORM,
@@ -8709,9 +8759,13 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
     (void)SelectSampledColorView(VK_FORMAT_A2B10G10R10_UNORM_PACK32,
                                  VK_FORMAT_A2R10G10B10_UNORM_PACK32,
                                  DstSel(6, 5, 4, 7));
+  } else if (std::strcmp(kind, "sampled-abgr-format") == 0) {
+    (void)SelectSampledColorView(VK_FORMAT_R8G8B8A8_UNORM,
+                                 VK_FORMAT_R8G8B8A8_UNORM,
+                                 DstSel(7, 6, 5, 4));
   } else if (std::strcmp(kind, "sampled-depth-format") == 0) {
-    (void)SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
-                                 VK_FORMAT_R16_UNORM, DstSel(4, 4, 4, 4));
+    (void)SelectSampledDepthView(VK_FORMAT_D24_UNORM_S8_UINT,
+                                 VK_FORMAT_R32_SFLOAT, DstSel(4, 4, 4, 4));
   } else if (std::strcmp(kind, "sampled-depth-swizzle") == 0) {
     (void)SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT, DstSel(4, 5, 6, 7));
@@ -8724,6 +8778,10 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
   } else if (std::strcmp(kind, "storage-compatible-swizzle") == 0) {
     (void)SelectStorageColorView(VK_FORMAT_B8G8R8A8_SRGB,
                                  VK_FORMAT_R8G8B8A8_UNORM, DstSel(4, 5, 6, 7));
+  } else if (std::strcmp(kind, "storage-abgr") == 0) {
+    (void)SelectStorageColorView(VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 DstSel(7, 6, 5, 4));
   } else {
     ShaderRecompiler::IR::ImageResource resource{};
     resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
@@ -8795,6 +8853,22 @@ void CheckSampledColorViews() {
                                      DstSel(6, 5, 4, 7)) ==
                   VulkanImage::VIEW_BGRA_TO_RGBA,
           "packed RGB10 target did not select its matching mutable channel-order view");
+  Require("SampledColorViews", "reverse RGBA16F sampled view",
+          SelectSampledColorView(VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 DstSel(7, 6, 5, 4)) == VulkanImage::VIEW_ABGR,
+          "reverse RGBA16F target did not select its reciprocal ABGR sampled view");
+  Require("SampledColorViews", "mutable integer-class views",
+          SelectSampledColorView(VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 VK_FORMAT_R16G16B16A16_UINT,
+                                 DstSel(4, 5, 6, 7)) == VulkanImage::VIEW_DEFAULT &&
+              SelectSampledColorView(VK_FORMAT_R8G8B8A8_UNORM,
+                                     VK_FORMAT_R8G8B8A8_UINT,
+                                     DstSel(4, 5, 6, 7)) == VulkanImage::VIEW_DEFAULT &&
+              SelectSampledColorView(VK_FORMAT_R8G8B8A8_UINT,
+                                     VK_FORMAT_R8G8B8A8_UNORM,
+                                     DstSel(4, 5, 6, 7)) == VulkanImage::VIEW_DEFAULT,
+          "compatible integer render-target sampled view was rejected");
   Require("SampledColorViews", "D32 depth target",
           SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT,
@@ -8806,6 +8880,21 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 0)) ==
               VulkanImage::VIEW_R000,
           "D16 depth target did not select its R000 depth-aspect view");
+  Require("SampledColorViews", "D16S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D16S8 depth target did not select its R001 depth-aspect view");
+  Require("SampledColorViews", "promoted D24S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D24S8 host fallback did not preserve the guest R16 depth view");
+  Require("SampledColorViews", "promoted D32S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D32S8 host fallback did not preserve the guest R16 depth view");
   Require("SampledColorViews", "D32S8 R001 depth target",
           SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT,
@@ -8827,6 +8916,10 @@ void CheckSampledColorViews() {
       SelectStorageColorView(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
                              DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_STORAGE,
       "RGBA8 BGRA storage did not select the identity storage view");
+  Require("SampledColorViews", "storage uint BGRA write mapping",
+          SelectStorageColorView(VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UINT,
+                                 DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_STORAGE,
+          "RGBA8_UINT BGRA storage did not select the identity storage view");
   Require(
       "SampledColorViews", "mutable BGRA sRGB storage view",
       SelectStorageColorView(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM,
@@ -8886,11 +8979,11 @@ void CheckSampledColorViews() {
           "GetModuleFileName failed");
   for (const char *kind :
        {"sampled", "sampled-compatible-swizzle", "sampled-compatible-reverse",
-        "sampled-compatible-class", "sampled-compatible-colorspace",
+        "sampled-compatible-colorspace",
         "sampled-compatible-snorm", "sampled-rgb10-swizzle",
-        "sampled-rgb10-reverse", "sampled-depth-format", "sampled-depth-swizzle",
-        "storage", "storage-format",
-        "storage-compatible-swizzle", "storage-kind", "storage-no-write",
+        "sampled-rgb10-reverse", "sampled-abgr-format", "sampled-depth-format",
+        "sampled-depth-swizzle", "storage", "storage-format",
+        "storage-compatible-swizzle", "storage-abgr", "storage-kind", "storage-no-write",
         "storage-atomic", "storage-compare", "storage-mip",
         "storage-dimension"}) {
     std::string command =
@@ -8962,6 +9055,17 @@ void CheckSampledDepthResource() {
   Require("SampledDepthResource", "integer rejected",
           !IsSupportedSampledDepthResource(resource),
           "integer depth resource was accepted");
+  Require("SampledDepthResource", "integer reinterpret resource",
+          IsSupportedSampledDepthUintResource(resource),
+          "read-only uint depth reinterpretation resource was rejected");
+  Require("SampledDepthResource", "D32 to R32_UINT",
+          IsDepthUintTextureReinterpretation(
+              VK_FORMAT_D32_SFLOAT,
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt), VK_FORMAT_R32_UINT) &&
+              !IsDepthUintTextureReinterpretation(
+                  VK_FORMAT_D16_UNORM,
+                  Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt), VK_FORMAT_R32_UINT),
+          "depth uint reinterpretation format boundary changed");
   std::printf("[host]    %-32s ok\n", "SampledDepthResource");
 }
 
@@ -8996,6 +9100,53 @@ void CheckSampledDepthDescriptor() {
   Require("SampledDepthDescriptor", "non-depth tile",
           !IsSupportedDepthTargetDescriptor(descriptor, image),
           "non-depth texture descriptor was accepted");
+
+  DepthTargetInfo target{};
+  target.address = 0x4a8c00000;
+  target.size = 0x100000;
+  target.width = 512;
+  target.height = 512;
+  target.pitch = 512;
+  target.layers = 1;
+  target.bytes_per_element = 4;
+  target.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  target.format = VK_FORMAT_D32_SFLOAT;
+  target.tile_mode = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  ImageInfo expanded{};
+  expanded.address = target.address;
+  expanded.size = 0x400000;
+  expanded.format = target.guest_format;
+  expanded.width = target.width;
+  expanded.height = target.height;
+  expanded.pitch = target.pitch;
+  expanded.levels = 1;
+  expanded.view_levels = 1;
+  expanded.depth = 4;
+  expanded.tile = target.tile_mode;
+  expanded.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+  Require("SampledDepthDescriptor", "PPSA01530 layer expansion",
+          IsSampledDepthExpansion(expanded, target),
+          "exact D32 per-layer expansion was rejected");
+  auto invalid_expansion = expanded;
+  invalid_expansion.pitch *= 2;
+  const bool rejects_pitch = !IsSampledDepthExpansion(invalid_expansion, target);
+  invalid_expansion = expanded;
+  invalid_expansion.address++;
+  const bool rejects_address = !IsSampledDepthExpansion(invalid_expansion, target);
+  invalid_expansion = expanded;
+  invalid_expansion.levels = 2;
+  const bool rejects_mips = !IsSampledDepthExpansion(invalid_expansion, target);
+  invalid_expansion = expanded;
+  invalid_expansion.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  const bool rejects_topology = !IsSampledDepthExpansion(invalid_expansion, target);
+  auto metadata_target = target;
+  metadata_target.htile_address = 0x4a9c00000;
+  metadata_target.htile_size = 0x10000;
+  const bool rejects_metadata = !IsSampledDepthExpansion(expanded, metadata_target);
+  Require("SampledDepthDescriptor", "expansion boundaries",
+          rejects_pitch && rejects_address && rejects_mips && rejects_topology &&
+              rejects_metadata,
+          "unsupported depth expansion topology was accepted");
   std::printf("[host]    %-32s ok\n", "SampledDepthDescriptor");
 }
 
@@ -9064,6 +9215,17 @@ ShaderRecompiler::IR::ImageResource BasicBgraStorageTextureResource() {
 ShaderTextureResource BasicBgraStorageTextureDescriptor() {
   return {{0x007c6500u, 0xc3800000u, 0x010dc1dfu, 0x91b00f2eu,
            0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u}};
+}
+
+ShaderTextureResource Ppsa01530MaxMipStorageTextureDescriptor() {
+  return {{0x04a42900u, 0xc3e00000u, 0x000fc00fu, 0x91b0022cu,
+           0x00000000u, 0x00700050u, 0x00000000u, 0x00000000u}};
+}
+
+ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
+  auto resource = BasicBgraStorageTextureResource();
+  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  return resource;
 }
 
 ShaderTextureResource Ppsa02527R16FloatStorageTextureDescriptor() {
@@ -9177,6 +9339,11 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
     resource = BasicArrayStorageTextureResource();
     descriptor = BasicArrayStorageTextureDescriptor();
     descriptor.fields[4] |= 1u << 16u;
+  } else if (std::strcmp(kind, "array-mip-view") == 0) {
+    resource = BasicArrayStorageTextureResource();
+    descriptor = BasicArrayStorageTextureDescriptor();
+    descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
+    descriptor.fields[5] |= 1u << 4u;
   } else if (std::strcmp(kind, "reserved") == 0) {
     descriptor.fields[1] |= 1u << 29u;
   } else if (std::strcmp(kind, "metadata") == 0) {
@@ -9229,6 +9396,26 @@ void CheckBasicStorageTextureDescriptor() {
               bgra.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
+
+  const auto max_mip = Ppsa01530MaxMipStorageTextureDescriptor();
+  Require("BasicStorageTexture", "PPSA01530 max-mip descriptor",
+          max_mip.Base40() == 0x4a4290000ull && max_mip.Width5() + 1u == 64 &&
+              max_mip.Height5() + 1u == 64 && max_mip.Depth() + 1u == 1 &&
+              max_mip.BaseLevel() == 0 && max_mip.LastLevel() == 0 &&
+              max_mip.MaxMip() == 5 &&
+              max_mip.Format() ==
+                  Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32UInt) &&
+              max_mip.TileMode() ==
+                  Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+              max_mip.DstSelXYZW() == DstSel(4, 5, 0, 1),
+          "PPSA01530 max-mip storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), max_mip, 0x20000);
+  auto mip_one = max_mip;
+  mip_one.fields[3] |= (1u << 12u) | (1u << 16u);
+  Require("BasicStorageTexture", "PPSA01530 mip-one descriptor",
+          mip_one.BaseLevel() == 1 && mip_one.LastLevel() == 1 && mip_one.MaxMip() == 5,
+          "PPSA01530 mip-one storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one, 0x20000);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R16F descriptor",
@@ -9326,6 +9513,16 @@ void CheckBasicStorageTextureDescriptor() {
               depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA14053 write-only depth-tile storage descriptor fixture is malformed");
   ValidateStorageTexture(Ppsa14053DepthTileStorageTextureResource(), depth_tile, 0x10000);
+  Require("BasicStorageTexture", "D32-compatible R32_UINT depth tile",
+          IsSupportedStorageDepthTile(
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
+              Prospero::GpuEnumValue(Prospero::ImageType::kColor2D), 64, 64, 1),
+          "write-only R32_UINT depth-tile recreation was rejected");
+  Require("BasicStorageTexture", "R32_UINT replicated write mapping",
+          IsSupportedStorageSwizzle(
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
+              DstSel(4, 4, 4, 4)),
+          "single-channel replicated destination selection was rejected");
 
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
@@ -9334,7 +9531,7 @@ void CheckBasicStorageTextureDescriptor() {
   for (const char *kind : {"resource", "type", "tile", "mip", "swizzle",
                            "linear-rgb1-read", "bgra-read", "r16-float-read", "r8-unorm-read",
                            "yzwx-read", "yzwx-format",
-                           "array-base-view", "reserved", "metadata", "uint-format",
+                           "array-base-view", "array-mip-view", "reserved", "metadata", "uint-format",
                            "uint-resource-float-format", "depth-tile-read",
                            "depth-tile-extent"}) {
     std::string command = std::string("\"") + path +
@@ -9576,6 +9773,180 @@ void CheckColorResolveLayers() {
   std::printf("[host]    %-32s ok\n", "ColorResolveLayers");
 }
 
+[[noreturn]] void RunStandard64RenderTargetDeathCase() {
+  RenderTargetInfo info{};
+  info.address = 0x10000;
+  info.size = 0x10000;
+  info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  info.width = 128;
+  info.height = 64;
+  info.pitch = 128;
+  info.bytes_per_element = 8;
+  info.tile_mode =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+  std::vector<uint8_t> linear(info.size, 0);
+  std::vector<uint8_t> tiled(info.size, 0);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  std::_Exit(0x7f);
+}
+
+void CheckStandard64RenderTargetTileRoundTrip() {
+  constexpr uint32_t format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  constexpr uint32_t tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+
+  constexpr uint32_t observed_width = 3840;
+  constexpr uint32_t observed_height = 2160;
+  const auto observed_pitch =
+      TileGetTexturePitch(format, observed_width, 1, tile);
+  TileSizeAlign observed{};
+  TileGetTextureSize(format, observed_width, observed_height, observed_pitch,
+                     1, tile, &observed, nullptr, nullptr);
+  Require("Standard64RenderTarget", "observed layout",
+          observed_pitch == 3840 && observed.size == 0x1fe0000 &&
+              observed.align == 0x10000,
+          "PPSA02721 Standard64KB render-target footprint changed");
+
+  constexpr uint32_t width = 257;
+  constexpr uint32_t height = 131;
+  const auto pitch = TileGetTexturePitch(format, width, 1, tile);
+  TileSizeAlign storage{};
+  TileGetTextureSize(format, width, height, pitch, 1, tile, &storage,
+                     nullptr, nullptr);
+  Require("Standard64RenderTarget", "partial layout",
+          pitch == 384 && storage.size == 0x60000 &&
+              storage.align == 0x10000,
+          "partial Standard64KB footprint was not padded in 128x128 blocks");
+
+  RenderTargetInfo info{};
+  info.address = 0x10000;
+  info.size = storage.size;
+  info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  info.width = width;
+  info.height = height;
+  info.pitch = pitch;
+  info.bytes_per_element = 4;
+  info.tile_mode = tile;
+  Require("Standard64RenderTarget", "support boundary",
+          IsSupportedStandard64RenderTarget(info) &&
+              IsTiledRenderTarget(info),
+          "exact Standard64KB render target was not classified as tiled");
+  Require(
+      "Standard64RenderTarget", "display tile boundary",
+      IsSupportedDisplayRenderTargetTileMode(
+          Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget)) &&
+          !IsSupportedDisplayRenderTargetTileMode(tile),
+      "Standard64KB render target could alias a mode-27 display image");
+  auto unsupported = info;
+  unsupported.address += 4;
+  Require("Standard64RenderTarget", "address guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unaligned Standard64KB backing was accepted");
+  unsupported = info;
+  unsupported.bytes_per_element = 8;
+  Require("Standard64RenderTarget", "element guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB element size was accepted");
+  unsupported = info;
+  unsupported.pitch += 128;
+  Require("Standard64RenderTarget", "pitch guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "non-minimal Standard64KB pitch was accepted");
+  unsupported = info;
+  unsupported.size += 0x10000;
+  Require("Standard64RenderTarget", "size guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "non-exact Standard64KB allocation was accepted");
+  unsupported = info;
+  unsupported.levels = 2;
+  Require("Standard64RenderTarget", "mip guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB mip chain was accepted");
+  unsupported = info;
+  unsupported.layers = 2;
+  Require("Standard64RenderTarget", "layer guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB array was accepted");
+
+  std::vector<uint32_t> linear(storage.size / sizeof(uint32_t), 0);
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      linear[static_cast<uint64_t>(y) * pitch + x] =
+          (y * 0x1f123bb5u) ^ (x * 0x9e3779b9u) ^ 0xa55a3cc3u;
+    }
+  }
+  std::vector<uint32_t> tiled(linear.size(), 0xcdcdcdcdu);
+  std::vector<uint32_t> restored(linear.size(), 0xa5a5a5a5u);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  TileConvertTiledToLinearStandard64KB32(
+      restored.data(), tiled.data(), width, height, pitch, storage.size);
+  for (uint32_t y = 0; y < height; y++) {
+    const auto row = static_cast<uint64_t>(y) * pitch;
+    Require("Standard64RenderTarget", "round trip",
+            std::memcmp(linear.data() + row, restored.data() + row,
+                        width * sizeof(uint32_t)) == 0,
+            "Standard64KB render-target conversion did not round-trip");
+  }
+  Require("Standard64RenderTarget", "padding",
+          tiled.back() == 0,
+          "Standard64KB render-target conversion retained stale padding");
+
+  constexpr uint32_t block_width = 128;
+  constexpr uint32_t block_height = 128;
+  constexpr uint64_t block_size = 0x10000;
+  std::vector<uint32_t> known(block_size / sizeof(uint32_t));
+  for (uint32_t i = 0; i < known.size(); i++) {
+    known[i] = i;
+  }
+  std::vector<uint32_t> standard(known.size(), 0);
+  std::vector<uint32_t> render_target(known.size(), 0);
+  TileConvertLinearToTiledStandard64KB32(
+      standard.data(), known.data(), block_width, block_height, block_width,
+      block_size);
+  Require("Standard64RenderTarget", "SDK byte mapping",
+          standard[0] == 0 && standard[1] == 1 && standard[2] == 2 &&
+              standard[4] == 128 && standard[8] == 256 &&
+              standard[16] == 512 && standard[32] == 4 &&
+              standard[16383] == 16383,
+          "Standard64KB reciprocal mapping disagreed with the PS5 SDK");
+  TileConvertLinearToTiledRenderTarget(
+      render_target.data(), known.data(), block_width, block_height,
+      block_width, sizeof(uint32_t), block_size);
+  Require("Standard64RenderTarget", "mode identity",
+          standard != render_target,
+          "Standard64KB was accidentally treated as RenderTarget/XOR tiling");
+
+  char path[MAX_PATH]{};
+  Require("Standard64RenderTarget", "host",
+          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string command =
+      std::string("\"") + path + "\" --standard64-rt-death";
+  std::vector<char> mutable_command(command.begin(), command.end());
+  mutable_command.push_back('\0');
+  STARTUPINFOA startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  Require("Standard64RenderTarget", "host",
+          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                         FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                         &process) != 0,
+          "CreateProcess failed");
+  Require("Standard64RenderTarget", "host",
+          WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+          "unsupported Standard64KB render-target case timed out");
+  DWORD exit_code = 0;
+  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  Require("Standard64RenderTarget", "hard failure",
+          exited && exit_code == 321,
+          "unsupported Standard64KB render-target shape lost its fatal guard");
+  std::printf("[host]    %-32s ok\n", "Standard64RenderTarget");
+}
+
 void CheckRenderTargetTileRoundTrip() {
   struct Case {
     uint32_t width;
@@ -9679,6 +10050,75 @@ void CheckRenderTargetTileRoundTrip() {
               regions[2].width == width && regions[2].height == height,
           "layered image-buffer regions did not preserve slice offsets");
   std::printf("[host]    %-32s ok\n", "RenderTargetTileRoundTrip");
+}
+
+void CheckStorageTextureMipTailRoundTrip() {
+  constexpr uint32_t format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32UInt);
+  ImageInfo info{};
+  info.address = 0x4a4290000ull;
+  info.format = format;
+  info.width = 64;
+  info.height = 64;
+  info.pitch = TileGetTexturePitch(
+      format, info.width, 6,
+      Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
+  info.levels = 6;
+  info.view_levels = 1;
+  info.tile = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  info.depth = 1;
+  info.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  TileSizeAlign total{};
+  TileSizeOffset levels[16]{};
+  TilePaddedSize padded[16]{};
+  TileGetTextureSize(format, info.width, info.height, info.pitch, info.levels,
+                     info.tile, &total, levels, padded);
+  info.size = total.size;
+  Require("StorageTextureMipTail", "layout",
+          info.pitch == 128 && info.size == 0x20000 &&
+              levels[0].src_offset == 0x10000 && levels[0].src_size == 0x10000 &&
+              levels[1].src_offset == 0 && levels[1].src_size == 0x10000,
+          "PPSA01530 mip-tail fixture disagrees with the PS5 layout");
+  auto layout = TextureCalcUploadLayout(
+      format, info.width, info.height, info.levels, info.depth, info.pitch,
+      info.tile, info.size, true, false, false, "StorageTextureMipTailTest");
+  auto regions = TextureBuildUploadRegions(
+      layout, VK_FORMAT_R32G32_UINT, info.width, info.height, info.depth,
+      info.levels, false, false, TextureUploadDestination::MipLevels,
+      TextureUploadSliceLayout::MipChainPerSlice);
+  std::vector<uint8_t> linear(info.size, 0);
+  for (uint32_t level = 0; level < info.levels; level++) {
+    auto &region = regions[level];
+    for (uint32_t y = 0; y < region.height; y++) {
+      auto *row = linear.data() + region.offset +
+                  static_cast<uint64_t>(y) * region.pitch * 8u;
+      for (uint32_t x = 0; x < region.width * 8u; x++) {
+        row[x] = static_cast<uint8_t>((level * 43u + y * 17u + x * 7u) & 0xffu);
+      }
+    }
+  }
+  std::vector<uint8_t> guest(info.size, 0xcd);
+  Tiler tiler;
+  tiler.TileImage(guest.data(), linear.data(), info);
+  std::vector<uint8_t> restored(info.size, 0);
+  for (uint32_t level = 0; level < info.levels; level++) {
+    const auto &region = regions[level];
+    const auto &level_size = layout.level_sizes[level];
+    const auto guest_offset = level_size.src_size != 0 ? level_size.src_offset
+                                                       : level_size.offset;
+    TileConvertTiledToLinearRenderTarget(
+        restored.data() + region.offset, guest.data() + guest_offset,
+        region.width, region.height, region.pitch, 8u, level_size.size,
+        level_size.src_size, level_size.x, level_size.y);
+    for (uint32_t y = 0; y < region.height; y++) {
+      const auto row = region.offset + static_cast<uint64_t>(y) * region.pitch * 8u;
+      Require("StorageTextureMipTail", "contents",
+              std::memcmp(linear.data() + row, restored.data() + row,
+                          region.width * 8u) == 0,
+              "multi-mip storage texture did not round-trip through its packed tail");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", "StorageTextureMipTail");
 }
 
 void CheckDepthTargetTileRoundTrip() {
@@ -9995,6 +10435,28 @@ void CheckStorageTextureSampledReuse() {
               VK_FORMAT_R8G8B8A8_UNORM, true, false, true) ==
               StorageSampledOverlap::ExactImage,
           "exact storage backing rejected a distinct sampled descriptor swizzle");
+  ImageInfo depth_uint_storage{};
+  depth_uint_storage.address = 0x4a5c90000;
+  depth_uint_storage.size = 0x10000;
+  depth_uint_storage.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt);
+  depth_uint_storage.width = 64;
+  depth_uint_storage.height = 64;
+  depth_uint_storage.pitch = 128;
+  depth_uint_storage.levels = 1;
+  depth_uint_storage.view_levels = 1;
+  depth_uint_storage.depth = 1;
+  depth_uint_storage.tile = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  depth_uint_storage.swizzle = DstSel(4, 4, 4, 4);
+  depth_uint_storage.type = image_2d;
+  auto depth_float_sampled = depth_uint_storage;
+  depth_float_sampled.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  depth_float_sampled.swizzle = DstSel(4, 0, 0, 1);
+  Require("StorageTextureSampledReuse", "PPSA01530 R32 view",
+          ClassifyStorageSampledOverlap(depth_float_sampled, depth_uint_storage,
+                                        VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT,
+                                        true, false, true) ==
+              StorageSampledOverlap::ExactImage,
+          "PPSA01530 GPU-owned R32_UINT storage image did not accept its exact R32_SFLOAT view");
   const auto usage = TextureFormatUsage::Sampled | TextureFormatUsage::Storage;
   Require("StorageTextureSampledReuse", "usage",
           (TextureGetUsage(usage) &
@@ -10346,6 +10808,8 @@ void CheckBufferImageWrites() {
   constexpr uint64_t video_size = 0x1fe0000ull;
   constexpr uint64_t target = 0x1158d80000ull;
   constexpr uint64_t target_size = 0x870000ull;
+  constexpr uint64_t storage_address = 0x4a4290000ull;
+  constexpr uint64_t storage_size = 0x20000ull;
   struct Case {
     const char *name;
     uint64_t buffer_address;
@@ -10401,9 +10865,18 @@ void CheckBufferImageWrites() {
            BufferImageWrite::Unsupported},
       Case{"video GPU-owned", video, video_size, video, video_size,
            BufferImageBinding::VideoOut, true, true,
-           BufferImageWrite::Unsupported},
+           BufferImageWrite::SynchronizeVideoOut},
       Case{"video unformatted", video, video_size, video, video_size,
            BufferImageBinding::VideoOut, false, false,
+           BufferImageWrite::Unsupported},
+      Case{"video GPU-owned unformatted", video, video_size, video, video_size,
+           BufferImageBinding::VideoOut, true, false,
+           BufferImageWrite::Unsupported},
+      Case{"video GPU-owned partial", video, video_size - 4, video, video_size,
+           BufferImageBinding::VideoOut, true, true,
+           BufferImageWrite::Unsupported},
+      Case{"video unaligned", video + 0x100, video_size, video + 0x100,
+           video_size, BufferImageBinding::VideoOut, true, true,
            BufferImageWrite::Unsupported},
       Case{"target exact", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, true, true,
@@ -10420,6 +10893,22 @@ void CheckBufferImageWrites() {
       Case{"target unaligned", target + 0x100, target_size, target + 0x100,
            target_size, BufferImageBinding::RenderTarget, true, true,
            BufferImageWrite::Unsupported},
+      Case{"storage mip page", storage_address + 0x10000, 0x10000, storage_address, storage_size,
+           BufferImageBinding::StorageTexture, true, true,
+           BufferImageWrite::SynchronizeStorageTexture},
+      Case{"storage unformatted", storage_address + 0x10000, 0x10000, storage_address, storage_size,
+           BufferImageBinding::StorageTexture, true, false,
+           BufferImageWrite::Unsupported},
+      Case{"storage unaligned", storage_address + 0x100, 0x10000, storage_address, storage_size,
+           BufferImageBinding::StorageTexture, true, true,
+           BufferImageWrite::Unsupported},
+      Case{"depth exact", 0x4a5c80000ull, 0x10000, 0x4a5c80000ull, 0x10000,
+           BufferImageBinding::DepthTarget, true, true,
+           BufferImageWrite::SynchronizeDepthTarget},
+      Case{"depth partial", 0x4a5c80000ull, 0x8000, 0x4a5c80000ull, 0x10000,
+           BufferImageBinding::DepthTarget, true, true, BufferImageWrite::Unsupported},
+      Case{"depth unformatted", 0x4a5c80000ull, 0x10000, 0x4a5c80000ull, 0x10000,
+           BufferImageBinding::DepthTarget, true, false, BufferImageWrite::Unsupported},
   };
   for (const auto &test : cases) {
     const auto actual = ClassifyBufferImageWrite(
@@ -10428,6 +10917,80 @@ void CheckBufferImageWrites() {
     Require("BufferImageWrite", test.name, actual == test.expected,
             "buffer/image write classification mismatch");
   }
+  Require("BufferImageWrite", "storage containing overwrite",
+          ClassifyBufferImageWrite(storage_address - 0x80000, 0x100000, storage_address,
+                                   storage_size, BufferImageBinding::StorageTexture, false, true,
+                                   true) == BufferImageWrite::InvalidateStorageTexture,
+          "formatted containing overwrite did not retain refreshable storage ownership");
+  Require("BufferImageWrite", "storage containing overwrite GPU-owned",
+          ClassifyBufferImageWrite(storage_address - 0x80000, 0x100000, storage_address,
+                                   storage_size, BufferImageBinding::StorageTexture, true, true,
+                                   false) == BufferImageWrite::Unsupported,
+          "containing overwrite bypassed GPU-owned storage synchronization");
+  Require("BufferImageWrite", "depth repeated buffer overwrite",
+          ClassifyBufferImageWrite(0x4a5cd0000ull, 0x10000, 0x4a5cd0000ull, 0x10000,
+                                   BufferImageBinding::DepthTarget, false, true, true) ==
+              BufferImageWrite::InvalidateDepthTarget,
+          "buffer-owned exact depth overwrite was rejected");
+
+  // PPSA01530's packed mip0 page is first synchronized out of a GPU-owned storage image,
+  // written through a persistent formatted buffer, and then rebound as the same storage image.
+  const auto partial_refresh = ClassifyStorageBufferRebind(
+      true, false, true, false, false, true);
+  const auto refreshed_reuse = ClassifyStorageBufferRebind(
+      true, true, false, true, false, true);
+  Require("BufferImageWrite", "storage partial lifecycle",
+          partial_refresh == StorageBufferRebind::RefreshFromBacking &&
+              refreshed_reuse == StorageBufferRebind::Reuse,
+          "storage-to-partial-buffer-to-storage lifecycle was rejected");
+  Require("BufferImageWrite", "storage partial incoherent",
+          ClassifyStorageBufferRebind(true, false, true, false, false, false) ==
+              StorageBufferRebind::Unsupported,
+          "incoherent partial storage backing was admitted");
+  Require("BufferImageWrite", "storage contradictory ownership",
+          ClassifyStorageBufferRebind(true, false, true, true, false, true) ==
+              StorageBufferRebind::Unsupported,
+          "contradictory storage tracker ownership was admitted");
+  Require("BufferImageWrite", "storage mip-one cache miss",
+          SelectImageBackingBaseLevel(true, 1) == 0 &&
+              SelectImageBackingBaseLevel(false, 1) == 1,
+          "storage backing creation remained dependent on first-bound view mip");
+  Require("BufferImageWrite", "dynamic one-layer array view",
+          !NeedsStaticSampledArrayView(true, true) &&
+              NeedsStaticSampledArrayView(true, false) &&
+              !NeedsStaticSampledArrayView(false, false),
+          "dynamic sampled array view was replaced by a missing static view");
+
+  DepthTargetInfo old_depth{};
+  old_depth.address = 0x4a5c90000ull;
+  old_depth.size = 0x10000;
+  old_depth.width = old_depth.height = 32;
+  old_depth.layers = 1;
+  DepthTargetInfo cleared_depth = old_depth;
+  cleared_depth.width = cleared_depth.height = 64;
+  cleared_depth.depth_load_clear = true;
+  Require("BufferImageWrite", "cleared depth reinterpretation",
+          ClassifyDepthTargetOverlap(old_depth, true, false, true, cleared_depth) ==
+              DepthOverlap::DiscardTarget,
+          "exact cleared depth allocation could not discard its old native shape");
+  cleared_depth.depth_load_clear = false;
+  Require("BufferImageWrite", "loaded depth reinterpretation",
+          ClassifyDepthTargetOverlap(old_depth, true, false, true, cleared_depth) ==
+              DepthOverlap::Unsupported,
+          "loaded depth reinterpretation discarded live native contents");
+  RenderTargetInfo color_alias{};
+  color_alias.address = old_depth.address;
+  color_alias.size = old_depth.size;
+  Require("BufferImageWrite", "buffer-owned depth to color",
+          CanRetireBufferOwnedDepthForRenderTarget(old_depth, false, true, true, true,
+                                                   color_alias) &&
+              !CanRetireBufferOwnedDepthForRenderTarget(old_depth, true, false, true, true,
+                                                        color_alias),
+          "depth-to-color recreation did not require coherent buffer ownership");
+  Require("BufferImageWrite", "page-neighbor depth to color",
+          !CanRetireBufferOwnedDepthForRenderTarget(old_depth, false, true, true, false,
+                                                    color_alias),
+          "same-page byte-disjoint buffer authorized depth-to-color recreation");
 
   TileSizeAlign storage{};
   Require("BufferImageWrite", "target layout",
@@ -10435,67 +10998,107 @@ void CheckBufferImageWrites() {
               TileGetRenderTargetSize(1920, 1080, 1920, 4, &storage) &&
               storage.align == 0x10000 && storage.size == target_size,
           "render-target write fixture has an invalid tiled layout");
+  Require("BufferImageWrite", "PPSA02721 video layout",
+          TileGetRenderTargetPitch(3840, 4) == 3840 &&
+              TileGetRenderTargetSize(3840, 2160, 3840, 4, &storage) &&
+              storage.align == 0x10000 && storage.size == video_size,
+          "4K video-out ownership fixture lost its exact tiled layout");
   std::printf("[host]    %-32s ok\n", "BufferImageWrite");
 }
 
 void CheckImageOverlapResolution() {
   CheckBufferImageWrites();
-	VideoOutPixelFormatInfo video_format {};
-	Require("ImageOverlapResolution", "existing video-out formats",
-	        DecodeVideoOutPixelFormat(0x8000000022000000ull, &video_format) &&
-	            video_format.format == VK_FORMAT_R8G8B8A8_SRGB &&
-	            video_format.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb) &&
-	            DecodeVideoOutPixelFormat(0x8000000000000000ull, &video_format) &&
-	            video_format.format == VK_FORMAT_B8G8R8A8_SRGB &&
-	            video_format.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb) &&
-	            DecodeVideoOutPixelFormat(0x8100000022000000ull, &video_format) &&
-	            video_format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
-	            video_format.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm),
-	        "pre-existing PS5 video-out format mappings changed during decoder centralization");
-	Require("ImageOverlapResolution", "B10G10R10A2 video-out format",
-	        DecodeVideoOutPixelFormat(0x8100000000000000ull, &video_format) &&
-	            video_format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
-	            video_format.guest_format ==
-	                Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm) &&
-	            IsSupportedVideoOutFormat(video_format.guest_format, video_format.format),
-	        "PS5 B10G10R10A2 sRGB video-out format did not preserve alternate channel order");
-	Require("ImageOverlapResolution", "video-out format guards",
-	        !DecodeVideoOutPixelFormat(0x8100070400000000ull, &video_format) &&
-	            !DecodeVideoOutPixelFormat(0x8100000000000000ull, nullptr) &&
-	            !IsSupportedVideoOutFormat(Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb),
-	                                       VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
-	            !IsSupportedVideoOutFormat(Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm),
-	                                       VK_FORMAT_R8G8B8A8_SRGB),
-	        "unsupported PS5 video-out formats or mismatched guest/host pairs were admitted");
+  VideoOutPixelFormatInfo video_format{};
+  Require(
+      "ImageOverlapResolution", "existing video-out formats",
+      DecodeVideoOutPixelFormat(0x8000000022000000ull, &video_format) &&
+          video_format.format == VK_FORMAT_R8G8B8A8_SRGB &&
+          video_format.guest_format ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb) &&
+          DecodeVideoOutPixelFormat(0x8000000000000000ull, &video_format) &&
+          video_format.format == VK_FORMAT_B8G8R8A8_SRGB &&
+          video_format.guest_format ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb) &&
+          DecodeVideoOutPixelFormat(0x8100000022000000ull, &video_format) &&
+          video_format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+          video_format.guest_format ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm),
+      "pre-existing PS5 video-out format mappings changed during decoder "
+      "centralization");
+  Require(
+      "ImageOverlapResolution", "B10G10R10A2 video-out format",
+      DecodeVideoOutPixelFormat(0x8100000000000000ull, &video_format) &&
+          video_format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
+          video_format.guest_format ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm),
+      "PS5 B10G10R10A2 sRGB video-out format did not preserve alternate "
+      "channel order");
+  Require(
+      "ImageOverlapResolution", "RGBA16 float video-out formats",
+      DecodeVideoOutPixelFormat(0xc001000622000000ull, &video_format) &&
+          video_format.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          video_format.guest_format ==
+              Prospero::GpuEnumValue(
+                  Prospero::BufferFormat::k16_16_16_16Float) &&
+          video_format.bytes_per_element == 8 &&
+          DecodeVideoOutPixelFormat(0xc001000600000000ull, &video_format) &&
+          video_format.bgra16,
+      "PS5 RGBA16-float video-out formats lost their 64-bpp storage contract");
+  VideoOutInfo supported_video_out{};
+  supported_video_out.format = video_format.format;
+  supported_video_out.guest_format = video_format.guest_format;
+  supported_video_out.bytes_per_element = video_format.bytes_per_element;
+  supported_video_out.bgra16 = video_format.bgra16;
+  Require(
+      "ImageOverlapResolution", "video-out format policy",
+      IsSupportedVideoOutFormat(supported_video_out),
+      "decoded PS5 video-out format was rejected by the centralized policy");
+  Require(
+      "ImageOverlapResolution", "video-out byte-size guards", ([&] {
+        auto mismatched = supported_video_out;
+        mismatched.bytes_per_element = 4;
+        return !IsSupportedVideoOutFormat(mismatched);
+      })(),
+      "video-out format validation admitted a mismatched storage element size");
+  Require(
+      "ImageOverlapResolution", "video-out format guards",
+      !DecodeVideoOutPixelFormat(0x8100070400000000ull, &video_format) &&
+          !DecodeVideoOutPixelFormat(0xc001070700000000ull, &video_format) &&
+          !DecodeVideoOutPixelFormat(0x8100000000000000ull, nullptr) && !([&] {
+            auto mismatched = supported_video_out;
+            mismatched.guest_format =
+                Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb);
+            return IsSupportedVideoOutFormat(mismatched);
+          })(),
+      "unsupported PS5 video-out formats or mismatched guest/host pairs were "
+      "admitted");
   TileSizeAlign render_target_layout{};
   Require("ImageOverlapResolution", "R8 render-target pitch",
           TileGetRenderTargetPitch(1920, 1) == 2048,
           "R8 target did not use native 256-pixel block width");
   Require("ImageOverlapResolution", "R8 render-target size",
-          TileGetRenderTargetSize(1920, 1080, 2048, 1,
-                                  &render_target_layout) &&
+          TileGetRenderTargetSize(1920, 1080, 2048, 1, &render_target_layout) &&
               render_target_layout.size == 0x280000 &&
               render_target_layout.align == 0x10000,
           "R8 target did not use native 64-KiB block geometry");
-  Require("ImageOverlapResolution", "RGBA8 render-target size",
-          TileGetRenderTargetPitch(1920, 4) == 1920 &&
-              TileGetRenderTargetSize(1920, 1080, 1920, 4,
-                                      &render_target_layout) &&
-              render_target_layout.size == 0x870000,
-          "RGBA8 target layout regressed");
+  Require(
+      "ImageOverlapResolution", "RGBA8 render-target size",
+      TileGetRenderTargetPitch(1920, 4) == 1920 &&
+          TileGetRenderTargetSize(1920, 1080, 1920, 4, &render_target_layout) &&
+          render_target_layout.size == 0x870000,
+      "RGBA8 target layout regressed");
   Require("ImageOverlapResolution", "PPSA19268 render-target edge",
           TileGetRenderTargetPitch(120, 8) == 128 &&
-              TileGetRenderTargetSize(120, 67, 128, 8,
-                                      &render_target_layout) &&
+              TileGetRenderTargetSize(120, 67, 128, 8, &render_target_layout) &&
               render_target_layout.size == 0x20000 &&
               ImageRangeOverlaps(0x11029fff8ull, 1, 0x110280000ull,
                                  render_target_layout.size),
           "title write did not land in the final native render-target block");
-  Require("ImageOverlapResolution", "render-target layout rejection",
-          TileGetRenderTargetPitch(1920, 3) == 0 &&
-              !TileGetRenderTargetSize(1920, 1080, 1920, 1,
-                                       &render_target_layout),
-          "unsupported element size or mismatched pitch was admitted");
+  Require(
+      "ImageOverlapResolution", "render-target layout rejection",
+      TileGetRenderTargetPitch(1920, 3) == 0 &&
+          !TileGetRenderTargetSize(1920, 1080, 1920, 1, &render_target_layout),
+      "unsupported element size or mismatched pitch was admitted");
 
   TileSizeOffset mip_levels[16]{};
   TilePaddedSize mip_padded[16]{};
@@ -11094,20 +11697,38 @@ void CheckImageOverlapResolution() {
                                    mismatched_depth) ==
                   DepthOverlap::Unsupported,
           "mipmapped or format-mismatched depth load was admitted");
-  Require("ImageOverlapResolution", "depth transition source",
-          SelectDepthTransitionSource(true, true, false, false, false, true) ==
-                  DepthTransitionSource::None &&
-              SelectDepthTransitionSource(false, true, false, false, false, true) ==
-                  DepthTransitionSource::Native &&
-              SelectDepthTransitionSource(false, false, false, false, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, true, false, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, false, true, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, false, false, true, true) ==
-                  DepthTransitionSource::Guest,
-          "clear, clean-native, or overlapping dirty-buffer depth preservation policy regressed");
+  struct DepthTransitionCase {
+    const char *name;
+    bool clear;
+    bool native;
+    bool sampled_cpu_dirty;
+    bool sampled_buffer_modified;
+    bool buffer_overlap;
+    bool buffer_cpu_dirty;
+    DepthTransitionSource expected;
+  };
+  constexpr DepthTransitionCase transition_cases[] = {
+      {"clear", true, true, false, false, false, true,
+       DepthTransitionSource::None},
+      {"clean native", false, true, false, false, false, true,
+       DepthTransitionSource::Native},
+      {"missing native", false, false, false, false, false, false,
+       DepthTransitionSource::Guest},
+      {"CPU-dirty native", false, true, true, false, false, false,
+       DepthTransitionSource::Guest},
+      {"buffer-modified native", false, true, false, true, false, false,
+       DepthTransitionSource::Guest},
+      {"dirty overlapping buffer", false, true, false, false, true, true,
+       DepthTransitionSource::Guest},
+  };
+  for (const auto &test : transition_cases) {
+    Require("ImageOverlapResolution", test.name,
+            SelectDepthTransitionSource(
+                test.clear, test.native, test.sampled_cpu_dirty,
+                test.sampled_buffer_modified, test.buffer_overlap,
+                test.buffer_cpu_dirty) == test.expected,
+            "depth preservation source changed");
+  }
   depth.depth_load_clear = true;
   depth.stencil_address = sampled.address + 0x6000;
   depth.stencil_size = 0x2000;
@@ -11136,6 +11757,7 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "stencil clear initializes",
           CanLoadStencilAttachment(depth, false),
           "stencil clear did not initialize the attachment");
+  depth.stencil_load_clear = false;
   depth.stencil_htile_compressed = false;
   Require("ImageOverlapResolution", "raw stencil load",
           CanLoadRawStencilPlane(depth),
@@ -11253,6 +11875,122 @@ void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
   TileSizeAlign depth{};
+  struct AttachmentFormatCase {
+    const char *name;
+    uint32_t depth_format;
+    uint32_t stencil_format;
+    VkFormat expected;
+  };
+  constexpr AttachmentFormatCase attachment_cases[] = {
+      {"Z16", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid),
+       VK_FORMAT_D16_UNORM},
+      {"Z16S8", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_D16_UNORM_S8_UINT},
+      {"Z32", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid),
+       VK_FORMAT_D32_SFLOAT},
+      {"Z32S8", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_D32_SFLOAT_S8_UINT},
+      {"invalid depth", 2,
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_UNDEFINED},
+      {"invalid stencil", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       2, VK_FORMAT_UNDEFINED},
+  };
+  for (const auto &test : attachment_cases) {
+    Require("DepthTargetFootprints", test.name,
+            DepthAttachmentFormat(test.depth_format, test.stencil_format) ==
+                test.expected,
+            "PS5 depth/stencil attachment mapping changed");
+  }
+  Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
+          TileGetDepthSize(1920, 1080, 0,
+                           Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+                           Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt), false,
+                           &stencil, &htile, &depth) &&
+              depth.size == 0x480000 && depth.align == 0x10000 &&
+              stencil.size == 0x280000 && stencil.align == 0x10000 && htile.size == 0,
+          "captured Z16S8 footprint disagrees with Prospero block rules");
+  struct TargetFormatCase {
+    const char *name;
+    VkFormat host_format;
+    uint32_t guest_format;
+    uint32_t bytes_per_element;
+    bool stencil;
+    bool supported;
+  };
+  constexpr TargetFormatCase target_cases[] = {
+      {"D16", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, false, true},
+      {"D16S8", VK_FORMAT_D16_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D16 via D24S8", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D16 via D32S8", VK_FORMAT_D32_SFLOAT_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D32", VK_FORMAT_D32_SFLOAT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, false, true},
+      {"D32S8", VK_FORMAT_D32_SFLOAT_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, true, true},
+      {"D16 plus stencil mismatch", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, false},
+      {"fallback without stencil", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, false, false},
+      {"D32 guest via D24", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, true, false},
+      {"D16 byte mismatch", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 4, false, false},
+  };
+  for (const auto &test : target_cases) {
+    DepthTargetInfo target{};
+    target.format = test.host_format;
+    target.guest_format = test.guest_format;
+    target.bytes_per_element = test.bytes_per_element;
+    target.stencil_address = test.stencil ? 0x10000 : 0;
+    target.stencil_size = test.stencil ? 0x10000 : 0;
+    Require("DepthTargetFootprints", test.name,
+            IsSupportedDepthTargetFormat(target) == test.supported,
+            "host/guest depth format policy changed");
+  }
+  struct TransferPlaneCase {
+    const char *name;
+    VkFormat attachment;
+    VkFormat transfer;
+    uint32_t bytes;
+  };
+  constexpr TransferPlaneCase transfer_cases[] = {
+      {"D16S8 transfer", VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D16_UNORM, 2},
+      {"D24S8 transfer", VK_FORMAT_D24_UNORM_S8_UINT,
+       VK_FORMAT_X8_D24_UNORM_PACK32, 4},
+      {"D32S8 transfer", VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D32_SFLOAT, 4},
+      {"invalid transfer", VK_FORMAT_R16_UNORM, VK_FORMAT_UNDEFINED, 0},
+  };
+  for (const auto &test : transfer_cases) {
+    Require("DepthTargetFootprints", test.name,
+            DepthAspectTransferFormat(test.attachment) == test.transfer &&
+                DepthAspectTransferBytes(test.attachment) == test.bytes,
+            "combined depth transfer-plane layout changed");
+  }
+  struct PromotionCase {
+    const char *name;
+    uint16_t source;
+    uint32_t d24;
+    uint32_t d32;
+  };
+  constexpr PromotionCase promotion_cases[] = {
+      {"zero", 0, 0, 0},
+      {"midpoint", 0x8000, 0x00800080, 0x3f000080},
+      {"maximum", 0xffff, 0x00ffffff, 0x3f800000},
+  };
+  for (const auto &test : promotion_cases) {
+    Require("DepthTargetFootprints", test.name,
+            EncodeD16AsD24(test.source) == test.d24 &&
+                EncodeD16AsD32(test.source) == test.d32,
+            "D16 host promotion changed the represented depth value");
+  }
   Require("DepthTargetFootprints", "640x360 Z32S8 without HTile",
           TileGetDepthSize(640, 360, 0, Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
                            Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt), false,
@@ -11327,6 +12065,14 @@ void CheckDepthTargetFootprints() {
 }
 
 void CheckHtileClearTargetResolution() {
+  HW::DepthDepthSizeXY one_pixel{};
+  one_pixel.valid = true;
+  Require("HtileClearTargetResolution", "1x1 encoded depth extent",
+          one_pixel.valid && one_pixel.x_max + 1u == 1u && one_pixel.y_max + 1u == 1u,
+          "zero DB_DEPTH_SIZE_XY fields were mistaken for an absent register");
+  HW::DepthDepthSizeXY absent{};
+  Require("HtileClearTargetResolution", "absent depth extent", !absent.valid,
+          "an unwritten DB_DEPTH_SIZE_XY register was admitted");
   HW::DepthRenderTarget descriptor_backed{};
   descriptor_backed.z_info.format = Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16);
   descriptor_backed.z_info.tile_surface_enable = true;
@@ -11396,6 +12142,18 @@ void CheckHtileClearTargetResolution() {
               resolved.address == derived_z16.htile_data_base_addr &&
               resolved.size == htile_size.size,
           "extent-derived Z16 depth-only HTile target was rejected");
+
+  auto derived_z16s8 = derived;
+  derived_z16s8.z_info.format = Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16);
+  Require("HtileClearTargetResolution", "derived Z16S8 target",
+          TileGetDepthSize(960, 540, 0, derived_z16s8.z_info.format,
+                           derived_z16s8.stencil_info.format, true, &stencil_size,
+                           &htile_size, &depth_size) &&
+              stencil_size.size != 0 && stencil_size.align == 0x10000 &&
+              ResolveHtileClearTarget(derived_z16s8, htile_size.size, &resolved) &&
+              resolved.address == derived_z16s8.htile_data_base_addr &&
+              resolved.size == htile_size.size,
+          "extent-derived Z16S8 HTile target was rejected");
   std::printf("[host]    %-32s ok\n", "HtileClearTargetResolution");
 }
 
@@ -11532,24 +12290,24 @@ void CheckEmbeddedFetchLaneSpill() {
 void CheckReferenceClockScale() {
   uint64_t value = 0;
   Require("ReferenceClockScale", "zero",
-          GraphicsScaleReferenceClock(0, 3000000000ull, &value) && value == 0,
+          Sync::ScaleReferenceClock(0, 3000000000ull, &value) && value == 0,
           "zero host tick did not produce a zero GPU clock");
   Require("ReferenceClockScale", "fractional second",
-          GraphicsScaleReferenceClock(1500000000ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(1500000000ull, 3000000000ull, &value) &&
               value == 50000000ull,
           "host half-second did not scale to 50,000,000 ticks");
   Require("ReferenceClockScale", "whole and fractional",
-          GraphicsScaleReferenceClock(3750000000ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(3750000000ull, 3000000000ull, &value) &&
               value == 125000000ull,
           "host 1.25 seconds did not scale to 125,000,000 ticks");
   Require("ReferenceClockScale", "monotonic floor",
-          GraphicsScaleReferenceClock(3750000001ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(3750000001ull, 3000000000ull, &value) &&
               value == 125000000ull,
           "sub-reference-tick increment did not use a monotonic floor");
   Require("ReferenceClockScale", "guards",
-          !GraphicsScaleReferenceClock(1, 0, &value) &&
-              !GraphicsScaleReferenceClock(1, 1, nullptr) &&
-              !GraphicsScaleReferenceClock(UINT64_MAX, 1, &value),
+          !Sync::ScaleReferenceClock(1, 0, &value) &&
+              !Sync::ScaleReferenceClock(1, 1, nullptr) &&
+              !Sync::ScaleReferenceClock(UINT64_MAX, 1, &value),
           "invalid frequency, destination, or overflow was accepted");
   std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
 }
@@ -11567,6 +12325,20 @@ int main(int argc, char **argv) {
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
+    RunReverseRenderTargetDeathCase();
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-death") == 0) {
+    RunStandard64RenderTargetDeathCase();
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
+    CheckReverseRenderTargetFormatContract();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
+    CheckStandard64RenderTargetTileRoundTrip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckImageOverlapResolution();
     return 0;
@@ -11579,6 +12351,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
     CheckColorResolveLayers();
     CheckRenderTargetTileRoundTrip();
+    CheckStorageTextureMipTailRoundTrip();
     CheckDepthTargetTileRoundTrip();
     CheckGpuMetadataReuse();
     return 0;
@@ -11640,6 +12413,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--metadata-descriptor-death") == 0) {
     RunMetadataDescriptorDeathCase(argv[2]);
   }
+  CheckReverseRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckSampledDepthResource();
   CheckSampledDepthDescriptor();
@@ -11650,7 +12424,9 @@ int main(int argc, char **argv) {
   CheckStorageTextureLinearReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
   CheckColorResolveLayers();
+  CheckStandard64RenderTargetTileRoundTrip();
   CheckRenderTargetTileRoundTrip();
+  CheckStorageTextureMipTailRoundTrip();
   CheckDepthTargetTileRoundTrip();
   CheckStencilTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
