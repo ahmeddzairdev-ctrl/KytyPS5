@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -9,11 +11,11 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/presentation/displayBuffer.h"
 
@@ -59,6 +61,32 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	       depth_fail == Prospero::GpuEnumValue(Prospero::StencilOp::kReplaceOp);
 }
 
+[[nodiscard]] static VkFormat ResolveHostDepthAttachmentFormat(GraphicContext*          ctx,
+                                                               const DepthFormatPolicy& policy,
+                                                               bool has_stencil) {
+	if (!has_stencil) {
+		return policy.depth_attachment_format;
+	}
+	switch (policy.depth_format) {
+		case Prospero::DepthFormat::kZ32F: return policy.stencil_attachment_formats.front();
+		case Prospero::DepthFormat::kZ16: {
+			if (ctx == nullptr) {
+				return VK_FORMAT_UNDEFINED;
+			}
+			for (const auto format: policy.stencil_attachment_formats) {
+				VkImageFormatProperties properties {};
+				if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+				                                  DepthTargetImageUsage(), 0,
+				                                  &properties) == VK_SUCCESS) {
+					return format;
+				}
+			}
+			return VK_FORMAT_UNDEFINED;
+		}
+		default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,
                               RenderDepthInfo* r) {
@@ -98,7 +126,10 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	    z.htile_surface.prefetch_height == 0 && z.htile_surface.dst_outside_zero_to_one == 0 &&
 	    z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
 	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0 &&
-	    !z.z_info.tile_surface_enable && !z.size.valid && !z.width_height_valid &&
+	    // DB_DEPTH_SIZE_XY is independent state and may remain programmed after the attachment
+	    // formats and addresses are unbound. A zero encoding is the valid 1x1 value, so its
+	    // presence alone must not manufacture a depth attachment.
+	    !z.z_info.tile_surface_enable && !z.width_height_valid &&
 	    !z.pitch_height_valid && z.size.x_max == 0 && z.size.y_max == 0 &&
 	    z.pitch_div8_minus1 == 0 && z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0 &&
 	    z.width == 0 && z.height == 0;
@@ -187,7 +218,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	} else if (z.htile_data_base_addr != 0) {
 		DepthFatal("HTile address without an enabled tile surface");
 	}
-	const bool size_xy_valid = z.size.valid && (z.size.x_max != 0 || z.size.y_max != 0);
+	const bool size_xy_valid = z.size.valid;
 	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;
 	if (!size_xy_valid && !wh_valid) {
 		DepthFatal("missing depth extent");
@@ -200,26 +231,21 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	     (z.pitch_div8_minus1 != 0 || z.height_div8_minus1 != 0 || z.slice_div64_minus1 != 0))) {
 		DepthFatal("inconsistent depth extent or encoded layout");
 	}
-	uint32_t guest_format = 0;
-	uint32_t bytes        = 0;
-	switch (static_cast<Prospero::DepthFormat>(z.z_info.format)) {
-		case Prospero::DepthFormat::kZ16:
-			if (has_stencil) {
-				DepthFatal("Z16 plus stencil is unsupported");
-			}
-			r->format    = VK_FORMAT_D16_UNORM;
-			guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
-			bytes        = 2;
-			break;
-		case Prospero::DepthFormat::kZ32F:
-			r->format    = has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
-			guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
-			bytes        = 4;
-			break;
-		default: DepthFatal("unsupported depth format");
+	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
+	if (policy == nullptr) {
+		DepthFatal("unsupported depth/stencil format pair");
 	}
-	const auto pitch = TileGetTexturePitch(guest_format, width, 1,
-	                                       Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
+	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
+	r->format =
+	    ResolveHostDepthAttachmentFormat(g_render_ctx->GetGraphicCtx(), *policy, has_stencil);
+	if (r->format == VK_FORMAT_UNDEFINED) {
+		DepthFatal("no host depth/stencil format supports required usage for %s",
+		           string_VkFormat(ideal_format));
+	}
+	const uint32_t guest_format = Prospero::GpuEnumValue(policy->guest_format);
+	const uint32_t bytes        = policy->bytes_per_element;
+	const auto     pitch = TileGetTexturePitch(guest_format, width, 1,
+	                                           Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	if (z.pitch_height_valid && ((static_cast<uint64_t>(z.pitch_div8_minus1) + 1u) * 8u != pitch ||
 	                             (static_cast<uint64_t>(z.height_div8_minus1) + 1u) * 8u !=
 	                                 ((static_cast<uint64_t>(height) + 7u) & ~7ull))) {
