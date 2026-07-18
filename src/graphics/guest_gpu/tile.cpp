@@ -1476,6 +1476,67 @@ void TileConvertTiledToLinearStandard64KB32(void* dst, const void* src, uint32_t
 	}
 }
 
+void TileConvertLinearToTiledStandard64KB32(void* dst, const void* src, uint32_t width,
+                                            uint32_t height, uint32_t pitch, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto rows           = static_cast<uint64_t>(height == 0 ? 0 : height - 1u);
+	const auto expected_pitch = (static_cast<uint64_t>(width) + 127u) & ~uint64_t {127u};
+	if (pitch != expected_pitch || size < (rows * pitch + width) * sizeof(uint32_t)) {
+		EXIT("invalid linear-to-Standard64KB32 conversion, dst=%p src=%p extent=%ux%u "
+		     "pitch=%u size=0x%016" PRIx64 "\n",
+		     dst, src, width, height, pitch, size);
+	}
+
+	auto*       dst32 = static_cast<uint32_t*>(dst);
+	const auto* src32 = static_cast<const uint32_t*>(src);
+	const auto& tables = GetStandard64KB32Tables();
+	const auto  blocks_per_row = (static_cast<uint64_t>(pitch) + 127u) >> 7u;
+	const auto  block_rows     = (static_cast<uint64_t>(height) + 127u) >> 7u;
+	if (blocks_per_row > UINT64_MAX / block_rows / 65536u ||
+	    size != blocks_per_row * block_rows * 65536u) {
+		EXIT("invalid Standard64KB32 allocation, extent=%ux%u pitch=%u size=0x%016" PRIx64
+		     " blocks=%" PRIu64 "x%" PRIu64 "\n",
+		     width, height, pitch, size, blocks_per_row, block_rows);
+	}
+	const auto* x_words = tables.x_words.data();
+	const auto* y_words = tables.y_words.data();
+
+	std::memset(dst32, 0, static_cast<size_t>(size));
+	for (uint32_t block_y = 0; block_y < height; block_y += 128u) {
+		const uint32_t block_height = std::min(128u, height - block_y);
+		for (uint32_t block_x = 0; block_x < width; block_x += 128u) {
+			const uint32_t block_width = std::min(128u, width - block_x);
+			const uint64_t block_base =
+			    (((static_cast<uint64_t>(block_y) >> 7u) * blocks_per_row) + (block_x >> 7u))
+			    << 14u;
+			if (block_width == 128u && block_height == 128u) {
+				for (uint32_t local_y = 0; local_y < 128u; local_y++) {
+					const uint64_t src_row =
+					    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
+					const uint64_t dst_row = block_base + y_words[local_y];
+					for (uint32_t local_x = 0; local_x < 128u; local_x += 4u) {
+						dst32[dst_row + x_words[local_x + 0u]] = src32[src_row + local_x + 0u];
+						dst32[dst_row + x_words[local_x + 1u]] = src32[src_row + local_x + 1u];
+						dst32[dst_row + x_words[local_x + 2u]] = src32[src_row + local_x + 2u];
+						dst32[dst_row + x_words[local_x + 3u]] = src32[src_row + local_x + 3u];
+					}
+				}
+				continue;
+			}
+
+			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
+				const uint64_t src_row =
+				    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
+				const uint64_t dst_row = block_base + y_words[local_y];
+				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
+					dst32[dst_row + x_words[local_x]] = src32[src_row + local_x];
+				}
+			}
+		}
+	}
+}
+
 void TileConvertTiledToLinearStandard64KB16(void* dst, const void* src, uint32_t width,
                                             uint32_t height, uint32_t pitch, uint64_t size,
                                             uint64_t src_size, uint32_t src_x, uint32_t src_y) {
@@ -1727,6 +1788,32 @@ static void TileConvertTiledToLinearStandard64KB64Elements(
 						dst64[dst_index] = src64[src_index];
 					}
 				}
+			}
+		}
+	}
+}
+
+static void TileConvertLinearToTiledStandard64KB64Elements(
+    void* dst, const void* src, uint32_t width_elements, uint32_t height_elements,
+    uint32_t pitch_elements, uint64_t size, uint64_t dst_size, uint32_t dst_x, uint32_t dst_y) {
+	if (width_elements > pitch_elements) {
+		EXIT("invalid linear-to-Standard64KB64 tail conversion, extent=%ux%u pitch=%u "
+		     "size=0x%016" PRIx64 " dst_size=0x%016" PRIx64 " dst=%u,%u\n",
+		     width_elements, height_elements, pitch_elements, size, dst_size, dst_x, dst_y);
+	}
+	auto*       dst64 = static_cast<uint64_t*>(dst);
+	const auto* src64 = static_cast<const uint64_t*>(src);
+	const auto& tables = GetStandard64KB64Tables();
+	const auto  size_words = size >> 3u;
+	const auto  dst_size_words = dst_size >> 3u;
+	for (uint32_t y = 0; y < height_elements; y++) {
+		const uint64_t src_row = static_cast<uint64_t>(y) * pitch_elements;
+		const uint64_t dst_row = tables.y_words[dst_y + y];
+		for (uint32_t x = 0; x < width_elements; x++) {
+			const uint64_t src_index = src_row + x;
+			const uint64_t dst_index = dst_row + tables.x_words[dst_x + x];
+			if (src_index < size_words && dst_index < dst_size_words) {
+				dst64[dst_index] = src64[src_index];
 			}
 		}
 	}
@@ -2413,8 +2500,20 @@ void TileConvertTiledToLinearRenderTarget(void* dst, const void* src, uint32_t w
 
 void TileConvertLinearToTiledRenderTarget(void* dst, const void* src, uint32_t width,
                                           uint32_t height, uint32_t pitch,
-                                          uint32_t bytes_per_element, uint64_t size) {
+                                          uint32_t bytes_per_element, uint64_t size,
+                                          uint64_t dst_size, uint32_t dst_x, uint32_t dst_y) {
 	KYTY_PROFILER_FUNCTION();
+	const bool tail_block = dst_size != 0 && (dst_x != 0 || dst_y != 0 || size < dst_size);
+	if (tail_block) {
+		//Not sure about this at all
+		if (bytes_per_element != 8) {
+			EXIT("unsupported linear-to-tiled render-target tail element size: %u\n",
+			     bytes_per_element);
+		}
+		TileConvertLinearToTiledStandard64KB64Elements(dst, src, width, height, pitch, size,
+		                                                   dst_size, dst_x, dst_y);
+		return;
+	}
 
 	if (dst == nullptr || src == nullptr || width == 0 || height == 0 || pitch == 0 ||
 	    width > pitch || bytes_per_element == 0 || size == 0 || size % bytes_per_element != 0) {
