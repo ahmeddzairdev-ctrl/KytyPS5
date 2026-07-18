@@ -240,6 +240,14 @@ static VulkanQueues VulkanFindQueues(VkPhysicalDevice device, VkSurfaceKHR surfa
 	    compute_num,
 	    [graphics_family](const auto& q) { return q.compute && q.family == graphics_family; },
 	    qs.compute);
+	if (compute_num != 0 && qs.compute.empty()) {
+		auto graphics_compute = std::find_if(qs.graphics.begin(), qs.graphics.end(),
+		                                     [](const auto& q) { return q.compute; });
+		if (graphics_compute != qs.graphics.end()) {
+			// Reuse the universal graphics queue when Intel GPUs expose no spare compute queue.
+			qs.compute.push_back(*graphics_compute);
+		}
+	}
 
 	select_queues(transfer_num, [](const auto& q) { return q.transfer; }, qs.transfer);
 	select_queues(present_num, [](const auto& q) { return q.present; }, qs.present);
