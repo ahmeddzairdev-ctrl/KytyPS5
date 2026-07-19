@@ -210,16 +210,33 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer* command
 	if (stride != 0 && records > UINT64_MAX / stride) {
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 	if (address == 0 || size == 0) {
 		BindNullStorageBuffer(command_buffer, &result);
 		return result;
 	}
 	auto* const ctx       = g_render_ctx->GetGraphicCtx();
 	const auto  alignment = ctx->StorageMinAlignment();
-	if (alignment == 0 || size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
-	    BufferCache::CACHING_PAGE_SIZE % alignment != 0) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
+	const auto  max_range = ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	if (alignment == 0 || BufferCache::CACHING_PAGE_SIZE % alignment != 0) {
+		EXIT("storage buffer device alignment is unsupported: alignment=0x%016" PRIx64
+		     " caching_page_size=0x%016" PRIx64 "\n",
+		     static_cast<uint64_t>(alignment), BufferCache::CACHING_PAGE_SIZE);
+	}
+	if (size > max_range) {
+		// EXPERIMENTAL, not upstream: this used to be a hard EXIT for any descriptor whose
+		// nominal stride*records exceeds VkPhysicalDeviceLimits::maxStorageBufferRange. Some
+		// guest V# descriptors legitimately encode a nominal range far bigger than the real
+		// data (effectively "unbounded"), which no desktop GPU's maxStorageBufferRange will
+		// ever satisfy. Clamping lets the frame continue; if a shader genuinely indexes past
+		// the real allocation it will read garbage/zero instead of us aborting the process.
+		// Logged loudly on purpose - if a game visibly corrupts after this point, that's the
+		// signal this clamp was the wrong call for that specific access and it should go back
+		// to a hard EXIT (or get real per-case handling) instead.
+		LOGF("storage buffer range 0x%016" PRIx64 " exceeds device max 0x%016" PRIx64
+		     ", clamping (addr=0x%016" PRIx64 ")\n",
+		     size, static_cast<uint64_t>(max_range), address);
+		size = max_range;
 	}
 	(void)submit_id;
 	auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(
@@ -435,6 +452,21 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	constexpr uint32_t field5_expected      = 0x00700000u;
 	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
+	// EXPERIMENTAL, not upstream: fields[6]/fields[7] carry MipStatsCntId, MsaaDepth,
+	// MaxUncompBlkSize, MaxCompBlkSize, MetaPipeAligned, WriteCompress, MetaCompress,
+	// DccAlphaPos, DccColorTransf and MetaAddr (see ShaderTextureResource in
+	// shaderBindings.h) - i.e. DCC/metadata-compression state, not reserved padding. The
+	// previous "fields[6] == 0 && fields[7] == 0" rejected every descriptor that carries any
+	// of that, which real hardware sets routinely (Stray's crash dump had MetaCompress and
+	// DccAlphaPos set, plus a real address in MetaAddr/fields[7]). Nothing else in this
+	// renderer reads MetaAddr()/MetaCompress()/etc. today - this backend detiles into a plain
+	// Vulkan image on upload rather than decoding AMD DCC - so those bits should be inert
+	// noise for a host-side storage-image bind. Only the bits nobody has decoded yet
+	// (field6_reserved_mask) are still required to be zero, and fields[7] is dropped from the
+	// check entirely since every bit of it is now accounted for by MetaAddr(). If a game's
+	// storage-image output looks corrupted after this change, that assumption is wrong for
+	// that case and it needs real DCC-aware handling instead of being waved through.
+	constexpr uint32_t field6_reserved_mask = 0x00007b00u;
 	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
 	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
@@ -444,7 +476,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	       descriptor.fields[3] == expected_field3 && descriptor.fields[4] == descriptor.Depth() &&
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected &&
-	       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
+	       (descriptor.fields[6] & field6_reserved_mask) == 0;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,

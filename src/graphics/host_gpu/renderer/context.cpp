@@ -343,13 +343,16 @@ void CommandBuffer::Execute() {
 	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 
 	if (result != VK_SUCCESS) {
-		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
+		// DIAGNOSTIC CHANGE: was LOGF(...) followed by EXIT_NOT_IMPLEMENTED(result !=
+		// VK_SUCCESS) - identical crash, but the actual VkResult lived in a LOGF line that is
+		// easy to lose when only the "--- Fatal Error ---" tail of a log gets copied/shared.
+		// Folding it into the EXIT message guarantees the result code survives.
+		EXIT("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
 		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
 		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
 		     m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
 }
 
 void CommandBuffer::ExecuteWithSemaphore(VkSemaphore signal_semaphore) {
@@ -508,13 +511,14 @@ void CommandBuffer::WaitForFenceOnly() {
 	auto* device = g_render_ctx->GetGraphicCtx()->device;
 	auto  result = vkWaitForFences(device, 1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
 	if (result != VK_SUCCESS) {
-		LOGF("vkWaitForFences failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
+		// DIAGNOSTIC CHANGE: see the matching note in Execute() above - same fold-into-EXIT
+		// fix so the VkResult (e.g. VK_ERROR_DEVICE_LOST) is never separated from the crash.
+		EXIT("vkWaitForFences failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
 		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
 		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
 		     m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
 	m_fence_waited = true;
 }
 
